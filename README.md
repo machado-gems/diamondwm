@@ -10,6 +10,7 @@ A simple, lightweight X11 window manager with a diamond-inspired design. Minimal
 - feh (for wallpaper support)
 - xterm (default terminal)
 - x11-apps (X11 utilities)
+- libxext-dev
 
 ### Install Dependencies
 ```bash

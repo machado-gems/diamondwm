@@ -987,6 +987,63 @@ void load_applications() {
     debug_log("=== APPLICATION LOADING COMPLETE ===");
 }
 
+void lock_screen() {
+    debug_log("Creating simple lock screen");
+
+    // Create a fullscreen lock window
+    Window lock_win = XCreateSimpleWindow(dpy, root, 0, 0,
+                                         DisplayWidth(dpy, screen),
+                                         DisplayHeight(dpy, screen),
+                                         0, black, black);
+
+    // Create a GC for the lock screen
+    XGCValues lock_gc_vals;
+    lock_gc_vals.foreground = white;
+    lock_gc_vals.background = black;
+    lock_gc_vals.font = XLoadFont(dpy, "fixed");
+    GC lock_gc = XCreateGC(dpy, lock_win, GCForeground | GCBackground | GCFont, &lock_gc_vals);
+
+    // Grab keyboard and pointer
+    XGrabKeyboard(dpy, root, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+    XGrabPointer(dpy, root, True, ButtonPressMask | PointerMotionMask,
+                 GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+
+    // Map the lock window
+    XMapWindow(dpy, lock_win);
+    XRaiseWindow(dpy, lock_win);
+
+    // Draw lock message
+    char *message = "Screen Locked - Press any key to unlock";
+    int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), message, strlen(message));
+    int x = (DisplayWidth(dpy, screen) - text_width) / 2;
+    int y = DisplayHeight(dpy, screen) / 2;
+
+    XDrawString(dpy, lock_win, lock_gc, x, y, message, strlen(message));
+    XFlush(dpy);
+
+    // Wait for any key press to unlock
+    XEvent ev;
+    int unlocked = 0;
+
+    while (!unlocked) {
+        XNextEvent(dpy, &ev);
+
+        if (ev.type == KeyPress || ev.type == ButtonPress) {
+            unlocked = 1;
+        }
+    }
+
+    // Cleanup
+    XUngrabKeyboard(dpy, CurrentTime);
+    XUngrabPointer(dpy, CurrentTime);
+    XUnmapWindow(dpy, lock_win);
+    XDestroyWindow(dpy, lock_win);
+    XFreeGC(dpy, lock_gc);
+
+    show_operation_feedback("Screen unlocked");
+    debug_log("Simple lock screen deactivated");
+}
+
 void create_app_launcher() {
     load_applications();
 
@@ -1687,10 +1744,10 @@ void handle_button_press(XButtonEvent *e) {
                         show_operation_feedback("Terminal launched");
                         return;
                     case 1: // Lock
-                        debug_log("Lock clicked - not implemented");
-                        hide_menu();
-                        show_operation_feedback("Lock screen not implemented");
-                        return;
+                      debug_log("Lock clicked - locking screen");
+                      hide_menu();
+                      lock_screen();
+                      return;
                     case 2: // Logout
                         debug_log("Logout clicked - exiting window manager");
                         hide_menu();
