@@ -1696,25 +1696,41 @@ void handle_button_release(XButtonEvent *e) {
 }
 
 void handle_motion_notify(XMotionEvent *e) {
+
+  static int last_x = 0, last_y = 0;
+
     // Handle panel dragging
-    if (panel_dragging && e->window == panel.win) {
-        int delta_x = e->x_root - drag_start_x;
-        int delta_y = e->x_root - drag_start_y;
-
-        // Move panel
-        panel.x += delta_x;
-        panel.y += delta_y;
-
-        XMoveWindow(dpy, panel.win, panel.x, panel.y);
-
-        drag_start_x = e->x_root;
-        drag_start_y = e->y_root;
-    }
+    // if (panel_dragging && e->window == panel.win) {
+    //     int delta_x = e->x_root - drag_start_x;
+    //     int delta_y = e->x_root - drag_start_y;
+    //
+    //     // Move panel
+    //     panel.x += delta_x;
+    //     panel.y += delta_y;
+    //
+    //     XMoveWindow(dpy, panel.win, panel.x, panel.y);
+    //
+    //     drag_start_x = e->x_root;
+    //     drag_start_y = e->y_root;
+    // }
 
     // Handle window dragging
     if (window_dragging && dragged_client) {
-        int new_x = e->x_root - drag_offset_x;
-        int new_y = e->x_root - drag_offset_y;
+        if (last_x == 0 && last_y == 0) {
+            // First motion event - initialize last positions
+            last_x = e->x_root;
+            last_y = e->y_root;
+        }
+
+        // Calculate movement delta
+        int delta_x = e->x_root - last_x;
+        int delta_y = e->y_root - last_y;
+
+        // Calculate new position
+        int new_x = dragged_client->x + delta_x;
+        int new_y = dragged_client->y + delta_y;
+
+        debug_log("Window dragging: delta=%d,%d, new_pos=%d,%d", delta_x, delta_y, new_x, new_y);
 
         // Constrain to screen boundaries
         int screen_width = DisplayWidth(dpy, screen);
@@ -1728,14 +1744,25 @@ void handle_motion_notify(XMotionEvent *e) {
         if (new_y + dragged_client->height > screen_height - PANEL_HEIGHT)
             new_y = screen_height - PANEL_HEIGHT - dragged_client->height;
 
-        // Move the window
-        XMoveWindow(dpy, dragged_client->frame, new_x, new_y);
+        // Only move if position changed
+        if (new_x != dragged_client->x || new_y != dragged_client->y) {
+            // Move the window
+            XMoveWindow(dpy, dragged_client->frame, new_x, new_y);
 
-        // Update client position
-        dragged_client->x = new_x;
-        dragged_client->y = new_y;
+            // Update client position
+            dragged_client->x = new_x;
+            dragged_client->y = new_y;
 
-        debug_log("Window moved to %d,%d", new_x, new_y);
+            debug_log("Window moved to %d,%d", new_x, new_y);
+        }
+
+        // Update last positions
+        last_x = e->x_root;
+        last_y = e->y_root;
+    } else {
+        // Reset last positions when not dragging
+        last_x = 0;
+        last_y = 0;
     }
 
     // Handle window resizing
