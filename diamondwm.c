@@ -1032,6 +1032,12 @@ void show_app_launcher(int x, int y) {
         XMapWindow(dpy, app_launcher.win);
         app_launcher.visible = 1;
 
+        // GRAB THE KEYBOARD with proper error handling
+        int grab_result = XGrabKeyboard(dpy, root, False, GrabModeAsync, GrabModeAsync, CurrentTime);
+        if (grab_result != GrabSuccess) {
+            debug_log("WARNING: Could not grab keyboard, search may not work properly");
+        }
+
         // Fade-in animation
         for (int i = 0; i <= 10; i++) {
             app_launcher.alpha = (float)i / 10.0f;
@@ -1060,7 +1066,50 @@ void hide_app_launcher() {
         app_launcher.hover_item = -1;
         app_launcher.search_mode = 0;
         app_launcher.search_text[0] = '\0';
+
+        // UNGRAB THE KEYBOARD when hiding
+        XUngrabKeyboard(dpy, CurrentTime);
         XUngrabPointer(dpy, CurrentTime);
+    }
+}
+
+// Add this function to filter applications based on search text
+void filter_applications_by_search() {
+    if (app_launcher.search_text[0] == '\0') {
+        // If search is empty, show all categories expanded
+        for (int i = 0; i < app_launcher.category_count; i++) {
+            if (app_launcher.categories[i].app_count > 0) {
+                app_launcher.categories[i].expanded = 1;
+            }
+        }
+        return;
+    }
+
+    // Convert search text to lowercase for case-insensitive search
+    char search_lower[256];
+    strncpy(search_lower, app_launcher.search_text, sizeof(search_lower)-1);
+    search_lower[sizeof(search_lower)-1] = '\0';
+    for (char *p = search_lower; *p; p++) *p = tolower(*p);
+
+    // Filter applications based on search text
+    for (int i = 0; i < app_launcher.category_count; i++) {
+        AppCategory *cat = &app_launcher.categories[i];
+        int match_count = 0;
+
+        // Count matching apps in this category
+        for (int j = 0; j < cat->app_count; j++) {
+            char app_name_lower[256];
+            strncpy(app_name_lower, cat->apps[j].name, sizeof(app_name_lower)-1);
+            app_name_lower[sizeof(app_name_lower)-1] = '\0';
+            for (char *p = app_name_lower; *p; p++) *p = tolower(*p);
+
+            if (strstr(app_name_lower, search_lower) != NULL) {
+                match_count++;
+            }
+        }
+
+        // Expand category only if it has matching apps
+        cat->expanded = (match_count > 0);
     }
 }
 
@@ -1077,15 +1126,14 @@ void draw_app_launcher() {
     XSetForeground(dpy, menu_gc, accent_color);
     XDrawRectangle(dpy, app_launcher.win, menu_gc, 1, 1, app_launcher.width - 3, app_launcher.height - 3);
 
-    // Draw search bar with visual feedback for active search
+    // Draw search bar
     if (app_launcher.search_mode) {
-        XSetForeground(dpy, menu_gc, accent_color); // Highlight when in search mode
+        XSetForeground(dpy, menu_gc, accent_color);
     } else {
         XSetForeground(dpy, menu_gc, 0x3D3D4D);
     }
     XFillRectangle(dpy, app_launcher.win, menu_gc, 10, 10, app_launcher.width-20, 30);
 
-    // Draw border around search bar
     XSetForeground(dpy, menu_gc, app_launcher.search_mode ? accent_color : 0x555555);
     XDrawRectangle(dpy, app_launcher.win, menu_gc, 10, 10, app_launcher.width-20, 30);
 
@@ -1102,9 +1150,23 @@ void draw_app_launcher() {
         }
     }
 
-    // Draw title with gradient
+    // Draw title with search info - FIXED TRUNCATION
     XSetForeground(dpy, menu_gc, text_primary);
-    XDrawString(dpy, app_launcher.win, menu_gc, 10, 55, "Applications", 12);
+    if (app_launcher.search_text[0] != '\0') {
+        char title[256];  // INCREASED BUFFER SIZE
+        // Truncate search text if too long for display
+        char display_search[50];
+        strncpy(display_search, app_launcher.search_text, sizeof(display_search)-1);
+        display_search[sizeof(display_search)-1] = '\0';
+        if (strlen(app_launcher.search_text) > sizeof(display_search)-1) {
+            strcpy(display_search + sizeof(display_search)-4, "...");
+        }
+        snprintf(title, sizeof(title), "Search: '%s'", display_search);
+        XDrawString(dpy, app_launcher.win, menu_gc, 10, 55, title, strlen(title));
+    } else {
+        XDrawString(dpy, app_launcher.win, menu_gc, 10, 55, "Applications", 12);
+    }
+
     XSetForeground(dpy, menu_gc, 0x404040);
     XDrawLine(dpy, app_launcher.win, menu_gc, 0, 60, app_launcher.width, 60);
 
@@ -1115,11 +1177,11 @@ void draw_app_launcher() {
         AppCategory *cat = &app_launcher.categories[i];
 
         if (cat->app_count == 0) continue;
+        if (!cat->expanded) continue; // Skip non-expanded categories
 
-        // Draw category name with hover effect
+        // Draw category name
         char category_text[100];
-        snprintf(category_text, sizeof(category_text), "%s [%s] (%d)",
-                cat->category_name, cat->expanded ? "-" : "+", cat->app_count);
+        snprintf(category_text, sizeof(category_text), "%s (%d)", cat->category_name, cat->app_count);
 
         // Hover effect for category
         if (app_launcher.hover_item == (i << 16)) {
@@ -1132,26 +1194,31 @@ void draw_app_launcher() {
         XDrawString(dpy, app_launcher.win, menu_gc, 20, y_pos, category_text, strlen(category_text));
         y_pos += 25;
 
-        // Draw apps if expanded
-        if (cat->expanded) {
-            for (int j = 0; j < cat->app_count; j++) {
-                // Hover effect for apps
-                if (app_launcher.hover_item == ((i << 16) | (j + 1))) {
-                    XSetForeground(dpy, menu_gc, menu_hover_bg);
-                    draw_rounded_rectangle(app_launcher.win, menu_gc, 35, y_pos - 15,
-                                          app_launcher.width - 45, 20, 4);
-                }
-
-                XSetForeground(dpy, menu_gc, text_secondary);
-                XDrawString(dpy, app_launcher.win, menu_gc, 40, y_pos,
-                           cat->apps[j].name, strlen(cat->apps[j].name));
-                y_pos += 20;
+        // Draw apps
+        for (int j = 0; j < cat->app_count; j++) {
+            // Hover effect for apps
+            if (app_launcher.hover_item == ((i << 16) | (j + 1))) {
+                XSetForeground(dpy, menu_gc, menu_hover_bg);
+                draw_rounded_rectangle(app_launcher.win, menu_gc, 35, y_pos - 15,
+                                      app_launcher.width - 45, 20, 4);
             }
+
+            XSetForeground(dpy, menu_gc, text_secondary);
+            XDrawString(dpy, app_launcher.win, menu_gc, 40, y_pos,
+                       cat->apps[j].name, strlen(cat->apps[j].name));
+            y_pos += 20;
         }
 
         y_pos += 5;
 
         if (y_pos > app_launcher.height - 20) break;
+    }
+
+    // Show search instructions
+    if (app_launcher.search_mode) {
+        XSetForeground(dpy, menu_gc, text_secondary);
+        XDrawString(dpy, app_launcher.win, menu_gc, 10, app_launcher.height - 10,
+                   "Press Enter to launch first result, Esc to cancel", 50);
     }
 }
 
@@ -2063,17 +2130,50 @@ void handle_key_press(XKeyEvent *e) {
             // Exit search mode
             app_launcher.search_mode = 0;
             app_launcher.search_text[0] = '\0';
+            filter_applications_by_search();
             draw_app_launcher();
         } else if (keysym == XK_Return) {
-            // Execute search (you can implement search logic here)
+            // Execute search - launch first matching app if any
             if (strlen(app_launcher.search_text) > 0) {
-                show_operation_feedback("Search executed");
+                // Find first matching application
+                for (int i = 0; i < app_launcher.category_count; i++) {
+                    AppCategory *cat = &app_launcher.categories[i];
+                    for (int j = 0; j < cat->app_count; j++) {
+                        char app_name_lower[256];
+                        strcpy(app_name_lower, cat->apps[j].name);
+                        for (char *p = app_name_lower; *p; p++) *p = tolower(*p);
+
+                        char search_lower[256];
+                        strcpy(search_lower, app_launcher.search_text);
+                        for (char *p = search_lower; *p; p++) *p = tolower(*p);
+
+                        if (strstr(app_name_lower, search_lower) != NULL) {
+                            // Launch the first matching app
+                            AppInfo *app = &cat->apps[j];
+                            debug_log("Launching search result: %s -> %s", app->name, app->exec);
+
+                            pid_t pid = fork();
+                            if (pid == 0) {
+                                setsid();
+                                execl("/bin/sh", "sh", "-c", app->exec, NULL);
+                                exit(0);
+                            } else if (pid > 0) {
+                                show_operation_feedback("Launched application");
+                                hide_app_launcher();
+                                return;
+                            }
+                            break;
+                        }
+                    }
+                }
+                show_operation_feedback("No matching applications found");
             }
         } else if (keysym == XK_BackSpace) {
             // Handle backspace
             int len = strlen(app_launcher.search_text);
             if (len > 0) {
                 app_launcher.search_text[len - 1] = '\0';
+                filter_applications_by_search();
                 draw_app_launcher();
             }
         } else if (count > 0 && buffer[0] >= 32 && buffer[0] <= 126) {
@@ -2082,6 +2182,7 @@ void handle_key_press(XKeyEvent *e) {
             if (len < sizeof(app_launcher.search_text) - 1) {
                 app_launcher.search_text[len] = buffer[0];
                 app_launcher.search_text[len + 1] = '\0';
+                filter_applications_by_search();
                 draw_app_launcher();
             }
         }
