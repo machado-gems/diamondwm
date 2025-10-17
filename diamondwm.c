@@ -1003,7 +1003,8 @@ void create_app_launcher() {
                                           app_launcher.width, app_launcher.height, 0,
                                           white, dark_blue);
 
-    XSelectInput(dpy, app_launcher.win, ButtonPressMask | ExposureMask | PointerMotionMask);
+    // ADD KeyPressMask to receive keyboard events
+    XSelectInput(dpy, app_launcher.win, ButtonPressMask | ExposureMask | PointerMotionMask | KeyPressMask);
     app_launcher.visible = 0;
 
     debug_log("App launcher created: %dx%d", app_launcher.width, app_launcher.height);
@@ -1076,15 +1077,29 @@ void draw_app_launcher() {
     XSetForeground(dpy, menu_gc, accent_color);
     XDrawRectangle(dpy, app_launcher.win, menu_gc, 1, 1, app_launcher.width - 3, app_launcher.height - 3);
 
-    // Draw search bar
-    XSetForeground(dpy, menu_gc, 0x3D3D4D);
+    // Draw search bar with visual feedback for active search
+    if (app_launcher.search_mode) {
+        XSetForeground(dpy, menu_gc, accent_color); // Highlight when in search mode
+    } else {
+        XSetForeground(dpy, menu_gc, 0x3D3D4D);
+    }
     XFillRectangle(dpy, app_launcher.win, menu_gc, 10, 10, app_launcher.width-20, 30);
 
-    XSetForeground(dpy, menu_gc, text_secondary);
+    // Draw border around search bar
+    XSetForeground(dpy, menu_gc, app_launcher.search_mode ? accent_color : 0x555555);
+    XDrawRectangle(dpy, app_launcher.win, menu_gc, 10, 10, app_launcher.width-20, 30);
+
+    XSetForeground(dpy, menu_gc, text_primary);
     if (app_launcher.search_text[0] == '\0') {
         XDrawString(dpy, app_launcher.win, menu_gc, 20, 30, "Search applications...", 21);
     } else {
         XDrawString(dpy, app_launcher.win, menu_gc, 20, 30, app_launcher.search_text, strlen(app_launcher.search_text));
+
+        // Show cursor when in search mode
+        if (app_launcher.search_mode) {
+            int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), app_launcher.search_text, strlen(app_launcher.search_text));
+            XDrawLine(dpy, app_launcher.win, menu_gc, 20 + text_width, 15, 20 + text_width, 25);
+        }
     }
 
     // Draw title with gradient
@@ -1402,7 +1417,7 @@ void draw_panel() {
 
     // Draw DiamondWM area with modern styling
     int diamond_size = 20;
-    int diamond_x = panel.width - 150;
+    int diamond_x = panel.width - 120;
     int diamond_y = (PANEL_HEIGHT - diamond_size) / 2;
 
     draw_diamond_icon(diamond_x, diamond_y, diamond_size);
@@ -2038,6 +2053,41 @@ void handle_motion_notify(XMotionEvent *e) {
 }
 
 void handle_key_press(XKeyEvent *e) {
+    // Handle app launcher search first
+    if (app_launcher.visible && app_launcher.search_mode) {
+        KeySym keysym;
+        char buffer[10];
+        int count = XLookupString(e, buffer, sizeof(buffer), &keysym, NULL);
+
+        if (keysym == XK_Escape) {
+            // Exit search mode
+            app_launcher.search_mode = 0;
+            app_launcher.search_text[0] = '\0';
+            draw_app_launcher();
+        } else if (keysym == XK_Return) {
+            // Execute search (you can implement search logic here)
+            if (strlen(app_launcher.search_text) > 0) {
+                show_operation_feedback("Search executed");
+            }
+        } else if (keysym == XK_BackSpace) {
+            // Handle backspace
+            int len = strlen(app_launcher.search_text);
+            if (len > 0) {
+                app_launcher.search_text[len - 1] = '\0';
+                draw_app_launcher();
+            }
+        } else if (count > 0 && buffer[0] >= 32 && buffer[0] <= 126) {
+            // Handle regular character input
+            int len = strlen(app_launcher.search_text);
+            if (len < sizeof(app_launcher.search_text) - 1) {
+                app_launcher.search_text[len] = buffer[0];
+                app_launcher.search_text[len + 1] = '\0';
+                draw_app_launcher();
+            }
+        }
+        return;
+    }
+
     Client *c = NULL;
     if (client_count > 0) {
         // Get the most recently managed window as fallback
@@ -2534,8 +2584,12 @@ int main() {
                     break;
 
                 case KeyPress:
-                    handle_key_press(&ev.xkey);
-                    break;
+                  if (app_launcher.visible && ev.xkey.window == app_launcher.win) {
+                      handle_key_press(&ev.xkey);
+                  } else {
+                      handle_key_press(&ev.xkey);
+                  }
+                  break;
 
                 case ConfigureRequest:
                     {
