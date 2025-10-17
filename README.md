@@ -15,6 +15,7 @@ A simple, lightweight X11 window manager with a diamond-inspired design. Minimal
 ```bash
 sudo apt update
 sudo apt install libx11-dev
+sudo apt install libxext-dev
 sudo apt install feh
 sudo apt install xterm
 sudo apt install x11-apps

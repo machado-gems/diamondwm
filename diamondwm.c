@@ -3,6 +3,7 @@
 #include <X11/Xatom.h>
 #include <X11/keysym.h>
 #include <X11/cursorfont.h>
+#include <X11/extensions/shape.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,7 @@
 #include <dirent.h>
 #include <pwd.h>
 #include <ctype.h>
+#include <math.h>
 
 #define PANEL_HEIGHT 50
 #define BORDER_WIDTH 1
@@ -22,6 +24,11 @@
 #define RESIZE_HANDLE_SIZE 8
 #define MENU_WIDTH 120
 #define MENU_ITEM_HEIGHT 30
+#define CORNER_RADIUS 8
+#define SHADOW_OFFSET 4
+#define SHADOW_BLUR 8
+#define ANIMATION_STEPS 10
+#define ANIMATION_DELAY 5000
 
 // Debug logging function
 void debug_log(const char* format, ...) {
@@ -46,8 +53,8 @@ void debug_log(const char* format, ...) {
 }
 
 typedef struct {
-    Window win;        // Client window
-    Window frame;      // Frame window
+    Window win;
+    Window frame;
     int x, y;
     int width, height;
     int is_mapped;
@@ -55,6 +62,8 @@ typedef struct {
     int original_x, original_y;
     int original_width, original_height;
     char *title;
+    int is_active;
+    int button_hover; // 0=none, 1=close, 2=minimize, 3=maximize
 } Client;
 
 typedef struct {
@@ -68,6 +77,8 @@ typedef struct {
     int visible;
     int x, y;
     int width, height;
+    int hover_item;
+    float alpha;
 } Menu;
 
 Display *dpy;
@@ -81,23 +92,22 @@ Menu menu;
 int panel_dragging = 0;
 int drag_start_x, drag_start_y;
 
-// Window dragging variables
 int window_dragging = 0;
 Client *dragged_client = NULL;
 int drag_win_start_x, drag_win_start_y;
 int drag_offset_x, drag_offset_y;
 
-// Window resizing variables
 int window_resizing = 0;
 Client *resized_client = NULL;
 int resize_start_x, resize_start_y;
 int resize_start_width, resize_start_height;
-int resize_edge; // 0=left, 1=right, 2=top, 3=bottom, 4=top-left, 5=top-right, 6=bottom-left, 7=bottom-right
+int resize_edge;
 
-// Color definitions
+// Modern color palette
 unsigned long black, white, dark_gray, light_gray, red, dark_blue;
-unsigned long titlebar_gray, button_red, button_yellow, button_green, purple_color;
-unsigned long menu_bg, menu_hover_bg;
+unsigned long titlebar_gray, titlebar_active, button_red, button_yellow, button_green, purple_color;
+unsigned long menu_bg, menu_hover_bg, accent_color, shadow_color;
+unsigned long bg_gradient_start, bg_gradient_end;
 
 typedef struct {
     char *name;
@@ -121,10 +131,13 @@ typedef struct {
     int width, height;
     AppCategory *categories;
     int category_count;
+    int hover_item;
+    float alpha;
 } AppLauncherMenu;
 
 AppLauncherMenu app_launcher;
 
+// Function declarations
 void create_panel();
 void draw_panel();
 void draw_window_decorations(Client *c);
@@ -149,7 +162,7 @@ int is_in_titlebar(Client *c, int x, int y);
 int get_resize_edge(Client *c, int x, int y);
 void send_wm_delete(Window w);
 void draw_clock();
-void draw_diamond_icon();
+void draw_diamond_icon(int x, int y, int size);
 int is_window_visible(Client *c);
 void check_clock_update();
 void create_menu();
@@ -168,12 +181,17 @@ int is_in_app_launcher_area(int x, int y);
 int get_app_launcher_item_at(int x, int y);
 void handle_app_launcher_click(int x, int y);
 void free_applications();
+void draw_rounded_rectangle(Drawable d, GC gc, int x, int y, int w, int h, int r);
+void draw_shadow(Drawable d, int x, int y, int w, int h);
+void animate_window_move(Client *c, int target_x, int target_y);
+void animate_window_resize(Client *c, int target_w, int target_h);
+void draw_gradient_rect(Drawable d, GC gc, int x, int y, int w, int h, unsigned long c1, unsigned long c2, int vertical);
+void draw_glow_button(Drawable d, int x, int y, int size, unsigned long color, int hover);
+void update_button_hover(Client *c, int x, int y);
 
 void set_background() {
-    // Try to set a background image using feh
     system("feh --bg-scale /usr/share/backgrounds/* 2>/dev/null &");
 
-    // Fallback: create a simple gradient background
     Pixmap bg_pixmap = XCreatePixmap(dpy, root,
                                     DisplayWidth(dpy, screen),
                                     DisplayHeight(dpy, screen),
@@ -181,9 +199,13 @@ void set_background() {
 
     GC bg_gc = XCreateGC(dpy, bg_pixmap, 0, NULL);
 
-    // Create a dark gradient background
+    // Modern gradient background (dark purple to dark blue)
     for (int y = 0; y < DisplayHeight(dpy, screen); y++) {
-        int color = 0x0a0a0a + (y * 0x010101) / 4;
+        float ratio = (float)y / DisplayHeight(dpy, screen);
+        int r = (int)(10 + ratio * 5);
+        int g = (int)(10 + ratio * 15);
+        int b = (int)(20 + ratio * 30);
+        unsigned long color = (r << 16) | (g << 8) | b;
         XSetForeground(dpy, bg_gc, color);
         XDrawLine(dpy, bg_pixmap, bg_gc, 0, y, DisplayWidth(dpy, screen), y);
     }
@@ -195,18 +217,168 @@ void set_background() {
     XFreePixmap(dpy, bg_pixmap);
 }
 
+void draw_gradient_rect(Drawable d, GC gc, int x, int y, int w, int h, unsigned long c1, unsigned long c2, int vertical) {
+    for (int i = 0; i < (vertical ? h : w); i++) {
+        float ratio = (float)i / (vertical ? h : w);
+
+        int r1 = (c1 >> 16) & 0xFF;
+        int g1 = (c1 >> 8) & 0xFF;
+        int b1 = c1 & 0xFF;
+
+        int r2 = (c2 >> 16) & 0xFF;
+        int g2 = (c2 >> 8) & 0xFF;
+        int b2 = c2 & 0xFF;
+
+        int r = r1 + (int)((r2 - r1) * ratio);
+        int g = g1 + (int)((g2 - g1) * ratio);
+        int b = b1 + (int)((b2 - b1) * ratio);
+
+        unsigned long color = (r << 16) | (g << 8) | b;
+        XSetForeground(dpy, gc, color);
+
+        if (vertical) {
+            XDrawLine(dpy, d, gc, x, y + i, x + w, y + i);
+        } else {
+            XDrawLine(dpy, d, gc, x + i, y, x + i, y + h);
+        }
+    }
+}
+
+void draw_rounded_rectangle(Drawable d, GC gc, int x, int y, int w, int h, int r) {
+    // Draw main rectangle
+    XFillRectangle(dpy, d, gc, x + r, y, w - 2*r, h);
+    XFillRectangle(dpy, d, gc, x, y + r, w, h - 2*r);
+
+    // Draw corners using arcs
+    XFillArc(dpy, d, gc, x, y, 2*r, 2*r, 90*64, 90*64);
+    XFillArc(dpy, d, gc, x + w - 2*r, y, 2*r, 2*r, 0, 90*64);
+    XFillArc(dpy, d, gc, x, y + h - 2*r, 2*r, 2*r, 180*64, 90*64);
+    XFillArc(dpy, d, gc, x + w - 2*r, y + h - 2*r, 2*r, 2*r, 270*64, 90*64);
+}
+
+void draw_shadow(Drawable d, int x, int y, int w, int h) {
+    // Simple shadow effect using multiple rectangles with decreasing opacity
+    for (int i = 0; i < SHADOW_BLUR; i++) {
+        int alpha = 255 - (i * 32);
+        unsigned long shadow = 0x000000 | ((alpha / 16) << 16) | ((alpha / 16) << 8) | (alpha / 16);
+
+        XSetForeground(dpy, gc, shadow);
+        XDrawRectangle(dpy, d, gc,
+                      x + SHADOW_OFFSET - i,
+                      y + SHADOW_OFFSET - i,
+                      w + 2*i,
+                      h + 2*i);
+    }
+}
+
+void animate_window_move(Client *c, int target_x, int target_y) {
+    int start_x = c->x;
+    int start_y = c->y;
+
+    for (int step = 1; step <= ANIMATION_STEPS; step++) {
+        float progress = (float)step / ANIMATION_STEPS;
+        // Ease-out curve
+        progress = 1 - (1 - progress) * (1 - progress);
+
+        int new_x = start_x + (int)((target_x - start_x) * progress);
+        int new_y = start_y + (int)((target_y - start_y) * progress);
+
+        XMoveWindow(dpy, c->frame, new_x, new_y);
+        XFlush(dpy);
+        usleep(ANIMATION_DELAY);
+    }
+
+    c->x = target_x;
+    c->y = target_y;
+}
+
+void animate_window_resize(Client *c, int target_w, int target_h) {
+    int start_w = c->width;
+    int start_h = c->height;
+
+    for (int step = 1; step <= ANIMATION_STEPS; step++) {
+        float progress = (float)step / ANIMATION_STEPS;
+        progress = 1 - (1 - progress) * (1 - progress);
+
+        int new_w = start_w + (int)((target_w - start_w) * progress);
+        int new_h = start_h + (int)((target_h - start_h) * progress);
+
+        c->width = new_w;
+        c->height = new_h;
+
+        XResizeWindow(dpy, c->frame, new_w, new_h);
+        XResizeWindow(dpy, c->win, new_w - 2 * FRAME_BORDER,
+                     new_h - TITLEBAR_HEIGHT - 2 * FRAME_BORDER);
+
+        draw_window_decorations(c);
+        XFlush(dpy);
+        usleep(ANIMATION_DELAY);
+    }
+}
+
+void draw_glow_button(Drawable d, int x, int y, int size, unsigned long color, int hover) {
+    // Draw glow effect if hovering
+    if (hover) {
+        // Outer glow
+        for (int i = 2; i > 0; i--) {
+            int alpha = 100 - (i * 30);
+            unsigned long glow_color = color;
+            XSetForeground(dpy, button_gc, glow_color);
+
+            XPoint glow[] = {
+                {x + size/2, y - i},
+                {x + size + i, y + size/2},
+                {x + size/2, y + size + i},
+                {x - i, y + size/2}
+            };
+            XDrawLines(dpy, d, button_gc, glow, 4, CoordModeOrigin);
+        }
+    }
+
+    // Main button
+    XSetForeground(dpy, button_gc, color);
+    XPoint diamond[] = {
+        {x + size/2, y},
+        {x + size, y + size/2},
+        {x + size/2, y + size},
+        {x, y + size/2}
+    };
+    XFillPolygon(dpy, d, button_gc, diamond, 4, Convex, CoordModeOrigin);
+
+    // Inner highlight for 3D effect
+    if (hover) {
+        XSetForeground(dpy, button_gc, white);
+        XDrawLine(dpy, d, button_gc, x + size/2, y + 1, x + size - 1, y + size/2);
+    }
+}
+
+void update_button_hover(Client *c, int x, int y) {
+    int old_hover = c->button_hover;
+    c->button_hover = 0;
+
+    if (is_in_close_button(c, x, y)) {
+        c->button_hover = 1;
+    } else if (is_in_minimize_button(c, x, y)) {
+        c->button_hover = 2;
+    } else if (is_in_maximize_button(c, x, y)) {
+        c->button_hover = 3;
+    }
+
+    if (old_hover != c->button_hover) {
+        draw_window_decorations(c);
+    }
+}
+
 int is_window_visible(Client *c) {
     if (!c) return 0;
 
     int screen_width = DisplayWidth(dpy, screen);
     int screen_height = DisplayHeight(dpy, screen);
 
-    // Check if window is completely outside screen bounds
     if (c->x >= screen_width || c->y >= screen_height) {
         return 0;
     }
 
-    // Check if window is partially visible (at least some part should be visible)
     if (c->x + c->width <= 0 || c->y + c->height <= 0) {
         return 0;
     }
@@ -215,7 +387,7 @@ int is_window_visible(Client *c) {
 }
 
 void draw_diamond_icon(int x, int y, int size) {
-    // Define diamond points
+    // Draw glowing purple diamond with gradient
     XPoint diamond[] = {
         {x + size/2, y},
         {x + size, y + size/2},
@@ -223,21 +395,36 @@ void draw_diamond_icon(int x, int y, int size) {
         {x, y + size/2}
     };
 
-    // Draw the purple diamond
+    // Glow effect
+    for (int i = 3; i > 0; i--) {
+        XSetForeground(dpy, panel_gc, purple_color - (i * 0x111111));
+        XPoint glow[] = {
+            {x + size/2, y - i},
+            {x + size + i, y + size/2},
+            {x + size/2, y + size + i},
+            {x - i, y + size/2}
+        };
+        XDrawLines(dpy, panel.win, panel_gc, glow, 4, CoordModeOrigin);
+    }
+
+    // Main diamond with gradient effect
     XSetForeground(dpy, panel_gc, purple_color);
     XFillPolygon(dpy, panel.win, panel_gc, diamond, 4, Convex, CoordModeOrigin);
+
+    // Highlight
+    XSetForeground(dpy, panel_gc, 0xAA44FF);
+    XDrawLine(dpy, panel.win, panel_gc, x + size/2, y, x + size - 1, y + size/2 - 1);
 }
 
 void draw_clock() {
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
-    char time_str[6]; // HH:MM format
+    char time_str[6];
 
     strftime(time_str, sizeof(time_str), "%H:%M", tm_info);
 
-    // Draw clock on the right side
     int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), time_str, strlen(time_str));
-    int x = panel.width - text_width - 20; // 20px from right edge
+    int x = panel.width - text_width - 180;
 
     XSetForeground(dpy, panel_gc, white);
     XDrawString(dpy, panel.win, panel_gc, x, 30, time_str, strlen(time_str));
@@ -247,40 +434,46 @@ void check_clock_update() {
     static time_t last_update = 0;
     time_t now = time(NULL);
 
-    // Update clock every second
     if (now != last_update) {
         last_update = now;
-        draw_panel(); // Redraw panel to update clock
+        draw_panel();
     }
 }
 
 void create_menu() {
     menu.width = MENU_WIDTH;
-    menu.height = MENU_ITEM_HEIGHT * 4; // 4 items
-    menu.x = panel.width - menu.width - 20; // Position near DiamondWM text
-    menu.y = panel.y - menu.height; // Position above panel
+    menu.height = MENU_ITEM_HEIGHT * 4;
+    menu.x = panel.width - menu.width - 20;
+    menu.y = panel.y - menu.height;
+    menu.hover_item = -1;
+    menu.alpha = 0.0f;
 
     menu.win = XCreateSimpleWindow(dpy, root, menu.x, menu.y,
-                                  menu.width, menu.height, 1,
+                                  menu.width, menu.height, 0,
                                   white, dark_blue);
 
-    XSelectInput(dpy, menu.win, ButtonPressMask | ExposureMask);
+    XSelectInput(dpy, menu.win, ButtonPressMask | ExposureMask | PointerMotionMask);
     menu.visible = 0;
 }
 
 void show_menu() {
     if (!menu.visible) {
-        // Position menu above DiamondWM area
-        int diamondwm_width = 120; // Approximate width of diamond + text
+        int diamondwm_width = 120;
         menu.x = panel.width - diamondwm_width - 20;
-        menu.y = panel.y - menu.height;
+        menu.y = panel.y - menu.height - 5;
 
         XMoveWindow(dpy, menu.win, menu.x, menu.y);
         XMapWindow(dpy, menu.win);
         menu.visible = 1;
-        draw_menu();
 
-        // Grab the pointer to detect clicks outside menu
+        // Fade-in animation
+        for (int i = 0; i <= 10; i++) {
+            menu.alpha = (float)i / 10.0f;
+            draw_menu();
+            XFlush(dpy);
+            usleep(10000);
+        }
+
         XGrabPointer(dpy, root, False, ButtonPressMask, GrabModeAsync,
                     GrabModeAsync, None, None, CurrentTime);
     }
@@ -288,10 +481,17 @@ void show_menu() {
 
 void hide_menu() {
     if (menu.visible) {
+        // Fade-out animation
+        for (int i = 10; i >= 0; i--) {
+            menu.alpha = (float)i / 10.0f;
+            draw_menu();
+            XFlush(dpy);
+            usleep(8000);
+        }
+
         XUnmapWindow(dpy, menu.win);
         menu.visible = 0;
-
-        // Ungrab the pointer
+        menu.hover_item = -1;
         XUngrabPointer(dpy, CurrentTime);
     }
 }
@@ -301,27 +501,31 @@ void draw_menu() {
 
     XClearWindow(dpy, menu.win);
 
-    // Draw menu background
+    // Draw rounded background with gradient
     XSetForeground(dpy, menu_gc, menu_bg);
-    XFillRectangle(dpy, menu.win, menu_gc, 0, 0, menu.width, menu.height);
+    draw_rounded_rectangle(menu.win, menu_gc, 0, 0, menu.width, menu.height, CORNER_RADIUS);
 
-    // Draw menu border
-    XSetForeground(dpy, menu_gc, white);
-    XDrawRectangle(dpy, menu.win, menu_gc, 0, 0, menu.width - 1, menu.height - 1);
+    // Draw subtle border
+    XSetForeground(dpy, menu_gc, accent_color);
+    XDrawRectangle(dpy, menu.win, menu_gc, 1, 1, menu.width - 3, menu.height - 3);
 
-    // Draw menu items
     char *items[] = {"Terminal", "Lock", "Logout", "Shutdown"};
-    XSetForeground(dpy, menu_gc, white);
 
     for (int i = 0; i < 4; i++) {
         int y = i * MENU_ITEM_HEIGHT;
 
-        // Draw separator line between items (except after last item)
-        if (i > 0) {
-            XDrawLine(dpy, menu.win, menu_gc, 0, y, menu.width, y);
+        // Hover effect
+        if (menu.hover_item == i) {
+            XSetForeground(dpy, menu_gc, menu_hover_bg);
+            draw_rounded_rectangle(menu.win, menu_gc, 2, y + 2, menu.width - 4, MENU_ITEM_HEIGHT - 4, 4);
         }
 
-        // Draw item text centered
+        if (i > 0) {
+            XSetForeground(dpy, menu_gc, 0x404040);
+            XDrawLine(dpy, menu.win, menu_gc, 10, y, menu.width - 10, y);
+        }
+
+        XSetForeground(dpy, menu_gc, white);
         int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), items[i], strlen(items[i]));
         int text_x = (menu.width - text_width) / 2;
         int text_y = y + (MENU_ITEM_HEIGHT / 2) + 5;
@@ -331,12 +535,11 @@ void draw_menu() {
 }
 
 int is_in_diamondwm_area(int x, int y) {
-    // Calculate DiamondWM text area (diamond + text)
     int diamond_size = 20;
     int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), "DiamondWM", 9);
-    int total_width = diamond_size + 5 + text_width; // diamond + spacing + text
+    int total_width = diamond_size + 5 + text_width;
 
-    int area_x = panel.width - total_width - 20; // 20px from right edge
+    int area_x = panel.width - total_width - 20;
     int area_y = 10;
     int area_height = 30;
 
@@ -357,7 +560,6 @@ int get_menu_item_at(int x, int y) {
     int relative_x = x - menu.x;
     int relative_y = y - menu.y;
 
-    // Check if click is within menu bounds
     if (relative_x < 0 || relative_x > menu.width ||
         relative_y < 0 || relative_y > menu.height) {
         return -1;
@@ -369,7 +571,6 @@ int get_menu_item_at(int x, int y) {
 void load_applications() {
     debug_log("=== STARTING APPLICATION LOADING ===");
 
-    // Common desktop file directories
     const char *desktop_dirs[] = {
         "/usr/share/applications",
         "/usr/local/share/applications",
@@ -377,7 +578,6 @@ void load_applications() {
         NULL
     };
 
-    // Category mapping - more comprehensive
     typedef struct {
         const char *category;
         const char *name;
@@ -405,7 +605,6 @@ void load_applications() {
         {NULL, NULL}
     };
 
-    // Get current username
     char username[100];
     struct passwd *pw = getpwuid(getuid());
     if (pw) {
@@ -416,7 +615,6 @@ void load_applications() {
     }
     debug_log("Loading apps for user: %s", username);
 
-    // First pass: count total .desktop files
     int total_files = 0;
     for (int i = 0; desktop_dirs[i] != NULL; i++) {
         char path[512];
@@ -452,7 +650,6 @@ void load_applications() {
         return;
     }
 
-    // Allocate temporary array for all apps
     AppInfo *all_apps = malloc(sizeof(AppInfo) * total_files);
     if (!all_apps) {
         debug_log("ERROR: Failed to allocate memory for %d apps", total_files);
@@ -462,7 +659,6 @@ void load_applications() {
 
     int app_index = 0;
 
-    // Second pass: read and parse desktop files
     for (int i = 0; desktop_dirs[i] != NULL; i++) {
         char path[512];
         if (strstr(desktop_dirs[i], "%s")) {
@@ -496,7 +692,6 @@ void load_applications() {
                 debug_log("  Parsing: %s", entry->d_name);
 
                 while (fgets(line, sizeof(line), file)) {
-                    // Remove newline and trailing whitespace
                     line[strcspn(line, "\n")] = 0;
                     char *end = line + strlen(line) - 1;
                     while (end > line && isspace(*end)) end--;
@@ -512,16 +707,14 @@ void load_applications() {
 
                     if (!in_desktop_entry) continue;
 
-                    // Check Type=Application
                     if (strncmp(line, "Type=", 5) == 0) {
                         if (strstr(line + 5, "Application")) {
                             is_application = 1;
                         } else {
-                            break; // Not an application, skip this file
+                            break;
                         }
                     }
 
-                    // Check Hidden
                     if (strncmp(line, "Hidden=", 7) == 0) {
                         if (strstr(line + 7, "true")) {
                             hidden = 1;
@@ -529,7 +722,6 @@ void load_applications() {
                         }
                     }
 
-                    // Check NoDisplay
                     if (strncmp(line, "NoDisplay=", 10) == 0) {
                         if (strstr(line + 10, "true")) {
                             no_display = 1;
@@ -537,33 +729,27 @@ void load_applications() {
                         }
                     }
 
-                    // Read Name
                     if (strncmp(line, "Name=", 5) == 0 && !app.name) {
                         app.name = strdup(line + 5);
                     }
 
-                    // Read Exec
                     if (strncmp(line, "Exec=", 5) == 0 && !app.exec) {
                         char *exec_cmd = line + 5;
-                        // Remove common field codes and arguments
                         char clean_exec[512];
                         char *dest = clean_exec;
 
                         for (char *src = exec_cmd; *src && (dest - clean_exec) < 510; src++) {
                             if (*src == '%' && *(src+1)) {
-                                // Skip field codes like %U, %F, %u, %f
-                                src++; // Skip the percent and the following character
+                                src++;
                                 continue;
                             }
                             if (*src == ' ' && (src == exec_cmd || *(src-1) == ' ')) {
-                                // Skip leading and multiple spaces
                                 continue;
                             }
                             *dest++ = *src;
                         }
                         *dest = '\0';
 
-                        // Remove trailing space if present
                         if (dest > clean_exec && *(dest-1) == ' ') {
                             *(dest-1) = '\0';
                         }
@@ -571,17 +757,14 @@ void load_applications() {
                         app.exec = strdup(clean_exec);
                     }
 
-                    // Read Categories
                     if (strncmp(line, "Categories=", 11) == 0 && !app.categories) {
                         app.categories = strdup(line + 11);
                     }
 
-                    // Read Comment
                     if (strncmp(line, "Comment=", 8) == 0 && !app.comment) {
                         app.comment = strdup(line + 8);
                     }
 
-                    // Read Icon
                     if (strncmp(line, "Icon=", 5) == 0 && !app.icon) {
                         app.icon = strdup(line + 5);
                     }
@@ -589,19 +772,15 @@ void load_applications() {
 
                 fclose(file);
 
-                // Validate and add the application
                 if (is_application && !hidden && !no_display && app.name && app.exec) {
-                    // If no categories, assign to Utilities
                     if (!app.categories) {
                         app.categories = strdup("Utility");
                     }
 
-                    // If no comment, use empty string
                     if (!app.comment) {
                         app.comment = strdup("");
                     }
 
-                    // If no icon, use empty string
                     if (!app.icon) {
                         app.icon = strdup("");
                     }
@@ -610,7 +789,6 @@ void load_applications() {
                     debug_log("    ✓ Loaded: %s -> %s (Categories: %s)",
                              app.name, app.exec, app.categories);
                 } else {
-                    // Free any allocated memory for invalid app
                     debug_log("    ✗ Skipped: %s (is_app=%d, hidden=%d, no_display=%d, has_name=%d, has_exec=%d)",
                              entry->d_name, is_application, hidden, no_display,
                              app.name != NULL, app.exec != NULL);
@@ -635,7 +813,6 @@ void load_applications() {
         return;
     }
 
-    // Count category occurrences
     int category_count = 0;
     for (int i = 0; category_map[i].category != NULL; i++) {
         category_count++;
@@ -657,7 +834,6 @@ void load_applications() {
 
     app_launcher.category_count = category_count;
 
-    // Initialize categories
     for (int i = 0; i < category_count; i++) {
         app_launcher.categories[i].category_name = strdup(category_map[i].name);
         app_launcher.categories[i].apps = NULL;
@@ -665,13 +841,11 @@ void load_applications() {
         app_launcher.categories[i].expanded = 0;
     }
 
-    // First, count apps per category
     for (int i = 0; i < app_index; i++) {
         char *categories = strdup(all_apps[i].categories);
         char *token = strtok(categories, ";");
 
         while (token) {
-            // Clean up category name (remove spaces)
             char clean_token[100];
             char *dest = clean_token;
             for (char *src = token; *src && (dest - clean_token) < 99; src++) {
@@ -692,30 +866,25 @@ void load_applications() {
         free(categories);
     }
 
-    // Allocate memory for apps in each category
     for (int i = 0; i < category_count; i++) {
         if (app_launcher.categories[i].app_count > 0) {
             app_launcher.categories[i].apps = malloc(sizeof(AppInfo) * app_launcher.categories[i].app_count);
             if (!app_launcher.categories[i].apps) {
                 debug_log("ERROR: Failed to allocate apps for category %s",
                          app_launcher.categories[i].category_name);
-                // Set count to 0 on allocation failure
                 app_launcher.categories[i].app_count = 0;
             } else {
-                // Reset counter for filling
                 app_launcher.categories[i].app_count = 0;
             }
         }
     }
 
-    // Now assign apps to categories
     for (int i = 0; i < app_index; i++) {
         char *categories = strdup(all_apps[i].categories);
         char *token = strtok(categories, ";");
         int assigned = 0;
 
         while (token && !assigned) {
-            // Clean up category name
             char clean_token[100];
             char *dest = clean_token;
             for (char *src = token; *src && (dest - clean_token) < 99; src++) {
@@ -740,7 +909,6 @@ void load_applications() {
             token = strtok(NULL, ";");
         }
 
-        // If app wasn't assigned to any known category, assign to Utilities
         if (!assigned) {
             for (int j = 0; j < category_count; j++) {
                 if (strcasecmp(category_map[j].category, "Utility") == 0) {
@@ -757,10 +925,8 @@ void load_applications() {
         free(categories);
     }
 
-    // Free the temporary array (but not the contents, as they're now in categories)
     free(all_apps);
 
-    // Final summary
     debug_log("=== APPLICATION LOADING SUMMARY ===");
     int total_loaded_apps = 0;
     int non_empty_categories = 0;
@@ -772,16 +938,6 @@ void load_applications() {
             debug_log("Category: %s - %d apps",
                      app_launcher.categories[i].category_name,
                      app_launcher.categories[i].app_count);
-
-            // Log first few apps in each category for verification
-            for (int j = 0; j < app_launcher.categories[i].app_count && j < 3; j++) {
-                debug_log("    %s -> %s",
-                         app_launcher.categories[i].apps[j].name,
-                         app_launcher.categories[i].apps[j].exec);
-            }
-            if (app_launcher.categories[i].app_count > 3) {
-                debug_log("    ... and %d more", app_launcher.categories[i].app_count - 3);
-            }
         }
     }
 
@@ -796,12 +952,14 @@ void create_app_launcher() {
     app_launcher.height = 600;
     app_launcher.x = 100;
     app_launcher.y = 100;
+    app_launcher.hover_item = -1;
+    app_launcher.alpha = 0.0f;
 
     app_launcher.win = XCreateSimpleWindow(dpy, root, app_launcher.x, app_launcher.y,
-                                          app_launcher.width, app_launcher.height, 2,
+                                          app_launcher.width, app_launcher.height, 0,
                                           white, dark_blue);
 
-    XSelectInput(dpy, app_launcher.win, ButtonPressMask | ExposureMask);
+    XSelectInput(dpy, app_launcher.win, ButtonPressMask | ExposureMask | PointerMotionMask);
     app_launcher.visible = 0;
 
     debug_log("App launcher created: %dx%d", app_launcher.width, app_launcher.height);
@@ -809,14 +967,12 @@ void create_app_launcher() {
 
 void show_app_launcher(int x, int y) {
     if (!app_launcher.visible) {
-        // Position at click location, but ensure it stays on screen
         int screen_width = DisplayWidth(dpy, screen);
         int screen_height = DisplayHeight(dpy, screen);
 
         app_launcher.x = x;
         app_launcher.y = y;
 
-        // Adjust if going off screen
         if (app_launcher.x + app_launcher.width > screen_width) {
             app_launcher.x = screen_width - app_launcher.width - 10;
         }
@@ -827,9 +983,15 @@ void show_app_launcher(int x, int y) {
         XMoveWindow(dpy, app_launcher.win, app_launcher.x, app_launcher.y);
         XMapWindow(dpy, app_launcher.win);
         app_launcher.visible = 1;
-        draw_app_launcher();
 
-        // Grab pointer to detect clicks outside
+        // Fade-in animation
+        for (int i = 0; i <= 10; i++) {
+            app_launcher.alpha = (float)i / 10.0f;
+            draw_app_launcher();
+            XFlush(dpy);
+            usleep(10000);
+        }
+
         XGrabPointer(dpy, root, False, ButtonPressMask, GrabModeAsync,
                     GrabModeAsync, None, None, CurrentTime);
     }
@@ -837,8 +999,17 @@ void show_app_launcher(int x, int y) {
 
 void hide_app_launcher() {
     if (app_launcher.visible) {
+        // Fade-out animation
+        for (int i = 10; i >= 0; i--) {
+            app_launcher.alpha = (float)i / 10.0f;
+            draw_app_launcher();
+            XFlush(dpy);
+            usleep(8000);
+        }
+
         XUnmapWindow(dpy, app_launcher.win);
         app_launcher.visible = 0;
+        app_launcher.hover_item = -1;
         XUngrabPointer(dpy, CurrentTime);
     }
 }
@@ -848,30 +1019,38 @@ void draw_app_launcher() {
 
     XClearWindow(dpy, app_launcher.win);
 
-    // Draw background
+    // Modern background with rounded corners
     XSetForeground(dpy, menu_gc, dark_blue);
-    XFillRectangle(dpy, app_launcher.win, menu_gc, 0, 0, app_launcher.width, app_launcher.height);
+    draw_rounded_rectangle(app_launcher.win, menu_gc, 0, 0, app_launcher.width, app_launcher.height, CORNER_RADIUS);
 
-    // Draw border
+    // Draw border with accent color
+    XSetForeground(dpy, menu_gc, accent_color);
+    XDrawRectangle(dpy, app_launcher.win, menu_gc, 1, 1, app_launcher.width - 3, app_launcher.height - 3);
+
+    // Draw title with gradient
     XSetForeground(dpy, menu_gc, white);
-    XDrawRectangle(dpy, app_launcher.win, menu_gc, 0, 0, app_launcher.width - 1, app_launcher.height - 1);
-
-    // Draw title
     XDrawString(dpy, app_launcher.win, menu_gc, 10, 20, "Applications", 12);
     XDrawLine(dpy, app_launcher.win, menu_gc, 0, 25, app_launcher.width, 25);
 
     int y_pos = 40;
 
-    // Draw categories and apps
+    // Draw categories and apps with modern styling
     for (int i = 0; i < app_launcher.category_count; i++) {
         AppCategory *cat = &app_launcher.categories[i];
 
         if (cat->app_count == 0) continue;
 
-        // Draw category name with expand/collapse indicator
+        // Draw category name with hover effect
         char category_text[100];
         snprintf(category_text, sizeof(category_text), "%s [%s] (%d)",
                 cat->category_name, cat->expanded ? "-" : "+", cat->app_count);
+
+        // Hover effect for category
+        if (app_launcher.hover_item == (i << 16)) {
+            XSetForeground(dpy, menu_gc, menu_hover_bg);
+            draw_rounded_rectangle(app_launcher.win, menu_gc, 15, y_pos - 15,
+                                  app_launcher.width - 30, 20, 4);
+        }
 
         XSetForeground(dpy, menu_gc, white);
         XDrawString(dpy, app_launcher.win, menu_gc, 20, y_pos, category_text, strlen(category_text));
@@ -880,17 +1059,22 @@ void draw_app_launcher() {
         // Draw apps if expanded
         if (cat->expanded) {
             for (int j = 0; j < cat->app_count; j++) {
-                XSetForeground(dpy, menu_gc, 0xCCCCCC); // Lighter color for apps
+                // Hover effect for apps
+                if (app_launcher.hover_item == ((i << 16) | (j + 1))) {
+                    XSetForeground(dpy, menu_gc, menu_hover_bg);
+                    draw_rounded_rectangle(app_launcher.win, menu_gc, 35, y_pos - 15,
+                                          app_launcher.width - 45, 20, 4);
+                }
+
+                XSetForeground(dpy, menu_gc, 0xCCCCCC);
                 XDrawString(dpy, app_launcher.win, menu_gc, 40, y_pos,
                            cat->apps[j].name, strlen(cat->apps[j].name));
                 y_pos += 20;
             }
         }
 
-        // Add some spacing between categories
         y_pos += 5;
 
-        // Stop if we're running out of space
         if (y_pos > app_launcher.height - 20) break;
     }
 }
@@ -913,42 +1097,35 @@ int get_app_launcher_item_at(int x, int y) {
         return -1;
     }
 
-    // Skip title area
     if (relative_y < 35) return -1;
 
-    int y_pos = 40; // Start after title
+    int y_pos = 40;
     int category_index = 0;
 
     for (int i = 0; i < app_launcher.category_count; i++) {
         AppCategory *cat = &app_launcher.categories[i];
         if (cat->app_count == 0) continue;
 
-        // Check if clicking category header (25px height)
         if (relative_y >= y_pos && relative_y <= y_pos + 20) {
-            return category_index; // Return category index
+            return category_index;
         }
         y_pos += 25;
 
-        // Check apps if category is expanded
         if (cat->expanded) {
             for (int j = 0; j < cat->app_count; j++) {
                 if (relative_y >= y_pos && relative_y <= y_pos + 20) {
-                    // Encode: category index in upper 16 bits, app index + 1 in lower 16 bits
                     return (i << 16) | (j + 1);
                 }
                 y_pos += 20;
             }
         }
 
-        // Add spacing between categories
         y_pos += 5;
         category_index++;
     }
 
     return -1;
 }
-
-
 
 void handle_app_launcher_click(int x, int y) {
     int item = get_app_launcher_item_at(x, y);
@@ -960,13 +1137,11 @@ void handle_app_launcher_click(int x, int y) {
         return;
     }
 
-    // Category click (simple index)
     if (item < 0x10000) {
         int cat_index = item;
         int actual_cat_index = -1;
         int count = 0;
 
-        // Find the actual category index (skip empty categories)
         for (int i = 0; i < app_launcher.category_count; i++) {
             if (app_launcher.categories[i].app_count > 0) {
                 if (count == cat_index) {
@@ -987,15 +1162,12 @@ void handle_app_launcher_click(int x, int y) {
         } else {
             debug_log("ERROR: Could not find category for index %d", cat_index);
         }
-    }
-    // App click (encoded)
-    else {
+    } else {
         int cat_index = (item >> 16) & 0xFFFF;
         int app_index = (item & 0xFFFF) - 1;
 
         debug_log("App clicked: category=%d, app=%d", cat_index, app_index);
 
-        // Find the actual category
         int actual_cat_index = -1;
         int count = 0;
         for (int i = 0; i < app_launcher.category_count; i++) {
@@ -1015,15 +1187,12 @@ void handle_app_launcher_click(int x, int y) {
             AppInfo *app = &app_launcher.categories[actual_cat_index].apps[app_index];
             debug_log("Launching: %s -> %s", app->name, app->exec);
 
-            // Fork and execute the application
             pid_t pid = fork();
             if (pid == 0) {
-                // Child process
                 setsid();
                 execl("/bin/sh", "sh", "-c", app->exec, NULL);
                 exit(0);
             } else if (pid > 0) {
-                // Parent process
                 hide_app_launcher();
             } else {
                 debug_log("ERROR: Failed to fork for application launch");
@@ -1055,277 +1224,6 @@ void free_applications() {
     if (app_launcher.categories) free(app_launcher.categories);
 }
 
-int main() {
-    // Clear previous log and start fresh
-    remove("/tmp/diamondwm_debug.log");
-    debug_log("=== DiamondWM Starting ===");
-
-    dpy = XOpenDisplay(NULL);
-    if (!dpy) {
-        debug_log("ERROR: Cannot open display");
-        fprintf(stderr, "Cannot open display\n");
-        exit(1);
-    }
-    debug_log("Display opened successfully");
-
-    screen = DefaultScreen(dpy);
-    root = RootWindow(dpy, screen);
-    debug_log("Screen: %d, Root window: %lu", screen, root);
-
-    // Define colors
-    black = BlackPixel(dpy, screen);
-    white = WhitePixel(dpy, screen);
-    dark_gray = 0x202020;
-    light_gray = 0x404040;
-    red = 0xFF4444;
-    dark_blue = 0x1b1b1c;
-    titlebar_gray = 0x2D2D2D;
-    button_red = 0x00FF;
-    button_yellow = 0xFFDA;
-    button_green = 0xDC14;
-    purple_color = 0x8A2BE2;
-    menu_bg = 0x2D2D2D;
-    menu_hover_bg = 0x404040;
-    debug_log("Colors defined");
-
-    // Create GC for window frames
-    XGCValues gv;
-    gv.foreground = light_gray;
-    gv.background = black;
-    gv.line_width = BORDER_WIDTH;
-    gc = XCreateGC(dpy, root, GCForeground | GCBackground | GCLineWidth, &gv);
-    debug_log("Frame GC created");
-
-    // Create GC for titlebar background
-    XGCValues title_gv;
-    title_gv.foreground = titlebar_gray;
-    title_gv.background = titlebar_gray;
-    title_gc = XCreateGC(dpy, root, GCForeground | GCBackground, &title_gv);
-    debug_log("Titlebar GC created");
-
-    set_background();
-    debug_log("Background set");
-
-    // Create GC for title text
-    XGCValues text_gv;
-    text_gv.foreground = white;
-    text_gv.background = titlebar_gray;
-    text_gv.font = XLoadFont(dpy, "fixed");
-    text_gc = XCreateGC(dpy, root, GCForeground | GCBackground | GCFont, &text_gv);
-    debug_log("Text GC created");
-
-    // Create GC for panel
-    XGCValues panel_gv;
-    panel_gv.foreground = white;
-    panel_gv.background = dark_blue;
-    panel_gv.font = XLoadFont(dpy, "fixed");
-    panel_gc = XCreateGC(dpy, root, GCForeground | GCBackground | GCFont, &panel_gv);
-    debug_log("Panel GC created");
-
-    // Create GC for menu
-    XGCValues menu_gv;
-    menu_gv.foreground = white;
-    menu_gv.background = menu_bg;
-    menu_gv.font = XLoadFont(dpy, "fixed");
-    menu_gc = XCreateGC(dpy, root, GCForeground | GCBackground | GCFont, &menu_gv);
-    debug_log("Menu GC created");
-
-    // Create GC for close button
-    XGCValues close_gv;
-    close_gv.foreground = button_red;
-    close_gv.background = titlebar_gray;
-    close_gc = XCreateGC(dpy, root, GCForeground | GCBackground, &close_gv);
-    debug_log("Close button GC created");
-
-    // Create GC for minimize button
-    XGCValues minimize_gv;
-    minimize_gv.foreground = button_yellow;
-    minimize_gv.background = titlebar_gray;
-    minimize_gc = XCreateGC(dpy, root, GCForeground | GCBackground, &minimize_gv);
-    debug_log("Minimize button GC created");
-
-    // Create GC for maximize button
-    XGCValues maximize_gv;
-    maximize_gv.foreground = button_green;
-    maximize_gv.background = titlebar_gray;
-    maximize_gc = XCreateGC(dpy, root, GCForeground | GCBackground, &maximize_gv);
-    debug_log("Maximize button GC created");
-
-    // Create GC for buttons (fallback)
-    XGCValues button_gv;
-    button_gv.foreground = light_gray;
-    button_gv.background = titlebar_gray;
-    button_gc = XCreateGC(dpy, root, GCForeground | GCBackground, &button_gv);
-    debug_log("Button GC created");
-
-    // Set up event masks
-    XSelectInput(dpy, root,
-        SubstructureRedirectMask | SubstructureNotifyMask |
-        ButtonPressMask | ButtonReleaseMask | PointerMotionMask | KeyPressMask);
-    debug_log("Event masks set");
-
-    // Create panel
-    create_panel();
-    debug_log("Panel created");
-
-    // Create menu
-    create_menu();
-    debug_log("Menu created");
-
-    create_app_launcher();
-    debug_log("Application launcher created");
-
-    // Setup mouse cursor
-    setup_mouse_cursor();
-    debug_log("Mouse cursor setup");
-
-    // Grab keys for window management
-    XGrabKey(dpy, XKeysymToKeycode(dpy, XK_F11), 0, root, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(dpy, XKeysymToKeycode(dpy, XK_F12), 0, root, True, GrabModeAsync, GrabModeAsync);
-    XGrabKey(dpy, XKeysymToKeycode(dpy, XK_Escape), ControlMask, root, True, GrabModeAsync, GrabModeAsync);
-    debug_log("Keys grabbed: F11, F12, Ctrl+Esc");
-
-    debug_log("DiamondWM initialization complete - entering main loop");
-    printf("DiamondWM started with macOS-style decorations!\n");
-    printf("Controls: F11=Fullscreen, F12=Lower window, Ctrl+Esc=Close window\n");
-    printf("Click window buttons: Red=Close, Yellow=Minimize, Green=Maximize\n");
-    printf("Drag titlebar to move windows! Drag edges to resize!\n");
-    printf("Click DiamondWM text on panel to show system menu!\n");
-    printf("LEFT-click desktop background to show application launcher!\n");
-    printf("RIGHT-click desktop background to always show application launcher!\n");
-    printf("Check /tmp/diamondwm_debug.log for detailed logs\n");
-
-    // Main event loop
-    XEvent ev;
-    int event_count = 0;
-
-    while (1) {
-        // Check for clock updates
-        check_clock_update();
-
-        // Check for events with a short timeout
-        if (XPending(dpy)) {
-            XNextEvent(dpy, &ev);
-            event_count++;
-
-            if (event_count % 20 == 0) {
-                debug_log("Event #%d: type=%d", event_count, ev.type);
-            }
-
-            switch (ev.type) {
-                case MapRequest:
-                    debug_log("MapRequest event for window %lu", ev.xmaprequest.window);
-                    manage_window(ev.xmaprequest.window);
-                    XMapWindow(dpy, ev.xmaprequest.window);
-                    break;
-
-                case UnmapNotify:
-                    debug_log("UnmapNotify event for window %lu", ev.xunmap.window);
-                    unmanage_window(ev.xunmap.window);
-                    break;
-
-                case DestroyNotify:
-                    debug_log("DestroyNotify event for window %lu", ev.xdestroywindow.window);
-                    // Handle client window destruction
-                    for (int i = 0; i < client_count; i++) {
-                        if (clients[i] && clients[i]->win == ev.xdestroywindow.window) {
-                            debug_log("Client window %lu destroyed, destroying frame %lu",
-                                     clients[i]->win, clients[i]->frame);
-                            Window frame = clients[i]->frame;
-                            unmanage_window(clients[i]->win);
-                            XDestroyWindow(dpy, frame);
-                            XFlush(dpy);
-                            break;
-                        }
-                    }
-                    break;
-
-                case ButtonPress:
-                    // Check if click is on root window (desktop background)
-                    if (ev.xbutton.window == root) {
-                        if (ev.xbutton.button == Button1) {
-                            // Left click - only show app launcher if no other menus are visible
-                            if (!app_launcher.visible && !menu.visible) {
-                                debug_log("Desktop background LEFT clicked at %d,%d - showing app launcher",
-                                         ev.xbutton.x_root, ev.xbutton.y_root);
-                                show_app_launcher(ev.xbutton.x_root, ev.xbutton.y_root);
-                            } else {
-                                // If menus are visible, the click will be handled by handle_button_press
-                                // which will close the visible menus
-                                handle_button_press(&ev.xbutton);
-                            }
-                        } else if (ev.xbutton.button == Button3) {
-                            // Right click - always show app launcher
-                            debug_log("Desktop background RIGHT clicked at %d,%d - showing app launcher",
-                                     ev.xbutton.x_root, ev.xbutton.y_root);
-                            show_app_launcher(ev.xbutton.x_root, ev.xbutton.y_root);
-                        }
-                    } else {
-                        handle_button_press(&ev.xbutton);
-                    }
-                    break;
-
-                case ButtonRelease:
-                    handle_button_release(&ev.xbutton);
-                    break;
-
-                case MotionNotify:
-                    handle_motion_notify(&ev.xmotion);
-                    break;
-
-                case KeyPress:
-                    handle_key_press(&ev.xkey);
-                    break;
-
-                case ConfigureRequest:
-                    {
-                        XConfigureRequestEvent *cre = &ev.xconfigurerequest;
-                        XWindowChanges wc;
-                        wc.x = cre->x;
-                        wc.y = cre->y;
-                        wc.width = cre->width;
-                        wc.height = cre->height;
-                        wc.border_width = cre->border_width;
-                        wc.sibling = cre->above;
-                        wc.stack_mode = cre->detail;
-                        XConfigureWindow(dpy, cre->window, cre->value_mask, &wc);
-                    }
-                    break;
-
-                case Expose:
-                    if (ev.xexpose.window == panel.win) {
-                        draw_panel();
-                    } else if (ev.xexpose.window == menu.win) {
-                        draw_menu();
-                    } else if (ev.xexpose.window == app_launcher.win) {
-                        draw_app_launcher();
-                    } else {
-                        // Check if this is a frame window that needs redrawing
-                        for (int i = 0; i < client_count; i++) {
-                            if (clients[i] && clients[i]->frame == ev.xexpose.window) {
-                                draw_window_decorations(clients[i]);
-                                break;
-                            }
-                        }
-                    }
-                    break;
-
-                default:
-                    break;
-            }
-        } else {
-            // No events, sleep briefly
-            usleep(100000); // 100ms
-        }
-    }
-
-    free_applications();
-
-    debug_log("=== DiamondWM Exiting ===");
-    XCloseDisplay(dpy);
-    return 0;
-}
-
 void create_panel() {
     int screen_width = DisplayWidth(dpy, screen);
     int screen_height = DisplayHeight(dpy, screen);
@@ -1347,7 +1245,6 @@ void create_panel() {
     XMapWindow(dpy, panel.win);
     debug_log("Panel window mapped");
 
-    // Make panel always on bottom
     XLowerWindow(dpy, panel.win);
     debug_log("Panel lowered to bottom");
 }
@@ -1355,10 +1252,8 @@ void create_panel() {
 void setup_mouse_cursor() {
     debug_log("Setting up mouse cursor");
 
-    // Create standard arrow cursor using font cursor
     Cursor cursor = XCreateFontCursor(dpy, XC_left_ptr);
 
-    // Set cursor for root window and all UI elements
     XDefineCursor(dpy, root, cursor);
     XDefineCursor(dpy, panel.win, cursor);
     XDefineCursor(dpy, menu.win, cursor);
@@ -1370,22 +1265,26 @@ void setup_mouse_cursor() {
 void draw_panel() {
     XClearWindow(dpy, panel.win);
 
-    // Draw panel background
-    XSetForeground(dpy, panel_gc, dark_blue);
-    XFillRectangle(dpy, panel.win, panel_gc, 0, 0, panel.width, panel.height);
+    // Modern panel with gradient
+    draw_gradient_rect(panel.win, panel_gc, 0, 0, panel.width, panel.height,
+                      dark_blue, 0x2D2D4D, 1);
 
-    // Draw client icons/buttons - ONLY FOR MAPPED WINDOWS
+    // Draw client icons/buttons with modern styling
     int x = 20;
     XSetForeground(dpy, panel_gc, white);
 
     for (int i = 0; i < client_count; i++) {
-        if (clients[i] && clients[i]->is_mapped) {  // Check is_mapped here
-            // Draw app icon (simple rectangle with window number)
+        if (clients[i] && clients[i]->is_mapped) {
+            // Modern app icon with rounded corners
             XSetForeground(dpy, panel_gc, 0x666666);
-            XFillRectangle(dpy, panel.win, panel_gc, x, 10, 40, 30);
+            draw_rounded_rectangle(panel.win, panel_gc, x, 10, 40, 30, 6);
 
-            // Draw border
-            XSetForeground(dpy, panel_gc, white);
+            // Border with accent color for active window
+            if (clients[i]->is_active) {
+                XSetForeground(dpy, panel_gc, accent_color);
+            } else {
+                XSetForeground(dpy, panel_gc, 0x888888);
+            }
             XDrawRectangle(dpy, panel.win, panel_gc, x, 10, 40, 30);
 
             // Draw window identifier
@@ -1396,43 +1295,41 @@ void draw_panel() {
         }
     }
 
-    // Draw DiamondWM area on the right (diamond + text)
+    // Draw DiamondWM area with modern styling
     int diamond_size = 20;
-    int diamond_x = panel.width - 150; // Position for diamond
+    int diamond_x = panel.width - 150;
     int diamond_y = (PANEL_HEIGHT - diamond_size) / 2;
 
-    // Draw diamond icon
     draw_diamond_icon(diamond_x, diamond_y, diamond_size);
 
-    // Draw DiamondWM text
     int text_x = diamond_x + diamond_size + 5;
     int text_y = 30;
     XDrawString(dpy, panel.win, panel_gc, text_x, text_y, "DiamondWM", 9);
 
-    // Draw clock on the right (before DiamondWM area)
     draw_clock();
 }
 
 void draw_window_decorations(Client *c) {
     if (!c || !c->frame) return;
 
-    debug_log("Drawing decorations for window %lu (frame: %lu) - Size: %dx%d",
-             c->win, c->frame, c->width, c->height);
+    debug_log("Drawing modern decorations for window %lu", c->win);
 
-    // Clear the entire frame
     XClearWindow(dpy, c->frame);
 
-    // Draw titlebar background - FULL WIDTH of the frame
-    XSetForeground(dpy, title_gc, titlebar_gray);
-    XFillRectangle(dpy, c->frame, title_gc, 0, 0, c->width, TITLEBAR_HEIGHT);
+    // Draw shadow effect
+    draw_shadow(c->frame, 0, 0, c->width, c->height);
 
-    // Draw window title - centered in available space after buttons
+    // Draw titlebar with gradient based on active state
+    if (c->is_active) {
+        draw_gradient_rect(c->frame, title_gc, 0, 0, c->width, TITLEBAR_HEIGHT,
+                          titlebar_active, 0x4D4D4D, 1);
+    } else {
+        draw_gradient_rect(c->frame, title_gc, 0, 0, c->width, TITLEBAR_HEIGHT,
+                          titlebar_gray, 0x3D3D3D, 1);
+    }
+
+    // Draw window title
     if (c->title) {
-        // Calculate available space for title (after buttons)
-        int title_available_width = c->width - 100; // Reserve space for buttons on left
-        int title_x = 80; // Start after buttons
-
-        // Truncate long titles if necessary
         char display_title[256];
         if (strlen(c->title) > 30) {
             strncpy(display_title, c->title, 27);
@@ -1441,63 +1338,46 @@ void draw_window_decorations(Client *c) {
             strcpy(display_title, c->title);
         }
 
-        // Center title in available space
         int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), display_title, strlen(display_title));
+        int title_x = 80;
+        int title_available_width = c->width - 100;
+
         if (text_width < title_available_width) {
             title_x = 80 + (title_available_width - text_width) / 2;
         }
 
-        int title_y = TITLEBAR_HEIGHT / 2 + 5; // Vertically center
+        int title_y = TITLEBAR_HEIGHT / 2 + 5;
 
-        debug_log("Drawing title: '%s' at position %d,%d (width: %d)",
-                 display_title, title_x, title_y, text_width);
+        XSetForeground(dpy, text_gc, c->is_active ? white : 0xCCCCCC);
         XDrawString(dpy, c->frame, text_gc, title_x, title_y, display_title, strlen(display_title));
     } else {
-        debug_log("Drawing default title 'Untitled'");
+        XSetForeground(dpy, text_gc, c->is_active ? white : 0xCCCCCC);
         XDrawString(dpy, c->frame, text_gc, 80, TITLEBAR_HEIGHT / 2 + 5, "Untitled", 8);
     }
 
-    // Draw diamond-shaped buttons - positioned relative to left side
+    // Draw modern glow buttons with hover effects
     int button_y = (TITLEBAR_HEIGHT - BUTTON_SIZE) / 2;
 
-    // Close button (red) - DIAMOND
-    XPoint close_diamond[] = {
-        {15 + BUTTON_SIZE/2, button_y},
-        {15 + BUTTON_SIZE, button_y + BUTTON_SIZE/2},
-        {15 + BUTTON_SIZE/2, button_y + BUTTON_SIZE},
-        {15, button_y + BUTTON_SIZE/2}
-    };
-    XSetForeground(dpy, close_gc, button_red);
-    XFillPolygon(dpy, c->frame, close_gc, close_diamond, 4, Convex, CoordModeOrigin);
+    // Close button with hover effect
+    draw_glow_button(c->frame, 15, button_y, BUTTON_SIZE, button_red, c->button_hover == 1);
 
-    // Minimize button (yellow) - DIAMOND
-    XPoint minimize_diamond[] = {
-        {15 + BUTTON_SIZE + BUTTON_SPACING + BUTTON_SIZE/2, button_y},
-        {15 + BUTTON_SIZE + BUTTON_SPACING + BUTTON_SIZE, button_y + BUTTON_SIZE/2},
-        {15 + BUTTON_SIZE + BUTTON_SPACING + BUTTON_SIZE/2, button_y + BUTTON_SIZE},
-        {15 + BUTTON_SIZE + BUTTON_SPACING, button_y + BUTTON_SIZE/2}
-    };
-    XSetForeground(dpy, minimize_gc, button_yellow);
-    XFillPolygon(dpy, c->frame, minimize_gc, minimize_diamond, 4, Convex, CoordModeOrigin);
+    // Minimize button with hover effect
+    draw_glow_button(c->frame, 15 + BUTTON_SIZE + BUTTON_SPACING, button_y, BUTTON_SIZE, button_yellow, c->button_hover == 2);
 
-    // Maximize button (green) - DIAMOND
-    XPoint maximize_diamond[] = {
-        {15 + 2*(BUTTON_SIZE + BUTTON_SPACING) + BUTTON_SIZE/2, button_y},
-        {15 + 2*(BUTTON_SIZE + BUTTON_SPACING) + BUTTON_SIZE, button_y + BUTTON_SIZE/2},
-        {15 + 2*(BUTTON_SIZE + BUTTON_SPACING) + BUTTON_SIZE/2, button_y + BUTTON_SIZE},
-        {15 + 2*(BUTTON_SIZE + BUTTON_SPACING), button_y + BUTTON_SIZE/2}
-    };
-    XSetForeground(dpy, maximize_gc, button_green);
-    XFillPolygon(dpy, c->frame, maximize_gc, maximize_diamond, 4, Convex, CoordModeOrigin);
+    // Maximize button with hover effect
+    draw_glow_button(c->frame, 15 + 2*(BUTTON_SIZE + BUTTON_SPACING), button_y, BUTTON_SIZE, button_green, c->button_hover == 3);
 
-    // Draw window border - around entire frame
-    XSetForeground(dpy, gc, light_gray);
+    // Draw window border with accent color for active window
+    if (c->is_active) {
+        XSetForeground(dpy, gc, accent_color);
+    } else {
+        XSetForeground(dpy, gc, light_gray);
+    }
     XDrawRectangle(dpy, c->frame, gc, 0, 0, c->width - 1, c->height - 1);
 
-    // Draw separator between titlebar and content - full width
+    // Draw separator between titlebar and content
+    XSetForeground(dpy, gc, 0x404040);
     XDrawLine(dpy, c->frame, gc, 0, TITLEBAR_HEIGHT, c->width, TITLEBAR_HEIGHT);
-
-    debug_log("Decorations drawn for window %lu with full width %d", c->win, c->width);
 }
 
 int is_in_close_button(Client *c, int x, int y) {
@@ -1743,7 +1623,7 @@ void handle_button_press(XButtonEvent *e) {
                     drag_win_start_x = c->x;
                     drag_win_start_y = c->y;
                     drag_offset_x = e->x_root - c->x;
-                    drag_offset_y = e->y_root - c->y;
+                    drag_offset_y = e->x_root - c->y;
 
                     debug_log("Window drag started: client=%lu, start_pos=%d,%d, offset=%d,%d",
                              c->win, drag_win_start_x, drag_win_start_y, drag_offset_x, drag_offset_y);
@@ -1792,7 +1672,7 @@ void handle_motion_notify(XMotionEvent *e) {
     // Handle panel dragging
     if (panel_dragging && e->window == panel.win) {
         int delta_x = e->x_root - drag_start_x;
-        int delta_y = e->y_root - drag_start_y;
+        int delta_y = e->x_root - drag_start_y;
 
         // Move panel
         panel.x += delta_x;
@@ -1807,7 +1687,7 @@ void handle_motion_notify(XMotionEvent *e) {
     // Handle window dragging
     if (window_dragging && dragged_client) {
         int new_x = e->x_root - drag_offset_x;
-        int new_y = e->y_root - drag_offset_y;
+        int new_y = e->x_root - drag_offset_y;
 
         // Constrain to screen boundaries
         int screen_width = DisplayWidth(dpy, screen);
@@ -1924,6 +1804,39 @@ void handle_motion_notify(XMotionEvent *e) {
 
         debug_log("Window resized to %dx%d at %d,%d", new_width, new_height, new_x, new_y);
     }
+
+    // Handle hover effects for windows
+    for (int i = 0; i < client_count; i++) {
+        if (clients[i] && clients[i]->frame == e->window) {
+            update_button_hover(clients[i], e->x, e->y);
+            break;
+        }
+    }
+
+    // Handle hover effects for menu
+    if (menu.visible && e->window == menu.win) {
+        int relative_y = e->y;
+        int new_hover_item = relative_y / MENU_ITEM_HEIGHT;
+
+        if (new_hover_item >= 0 && new_hover_item < 4) {
+            if (menu.hover_item != new_hover_item) {
+                menu.hover_item = new_hover_item;
+                draw_menu();
+            }
+        } else if (menu.hover_item != -1) {
+            menu.hover_item = -1;
+            draw_menu();
+        }
+    }
+
+    // Handle hover effects for app launcher
+    if (app_launcher.visible && e->window == app_launcher.win) {
+        int new_hover_item = get_app_launcher_item_at(e->x_root, e->y_root);
+        if (app_launcher.hover_item != new_hover_item) {
+            app_launcher.hover_item = new_hover_item;
+            draw_app_launcher();
+        }
+    }
 }
 
 void handle_key_press(XKeyEvent *e) {
@@ -1975,6 +1888,8 @@ void manage_window(Window w) {
     c->win = w;
     c->is_mapped = 1;
     c->is_fullscreen = 0;
+    c->is_active = 1; // New window is active by default
+    c->button_hover = 0;
 
     // Get window attributes
     XWindowAttributes wa;
@@ -2023,7 +1938,7 @@ void manage_window(Window w) {
     XResizeWindow(dpy, w, c->width - 2 * FRAME_BORDER,
                   c->height - TITLEBAR_HEIGHT - 2 * FRAME_BORDER);
 
-    // Try to get window title - IMPROVED: Try multiple properties
+    // Try to get window title
     c->title = get_window_title(w);
     debug_log("Window title: '%s'", c->title);
 
@@ -2210,4 +2125,262 @@ Client* find_client(Window w) {
         }
     }
     return NULL;
+}
+
+void send_wm_delete(Window w) {
+    Atom wm_protocols = XInternAtom(dpy, "WM_PROTOCOLS", False);
+    Atom wm_delete_window = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
+    Atom *protocols;
+    int num_protocols;  // Changed from unsigned long to int
+
+    if (XGetWMProtocols(dpy, w, &protocols, &num_protocols)) {
+        for (int i = 0; i < num_protocols; i++) {  // Changed from unsigned long to int
+            if (protocols[i] == wm_delete_window) {
+                XEvent ev;
+                ev.type = ClientMessage;
+                ev.xclient.window = w;
+                ev.xclient.message_type = wm_protocols;
+                ev.xclient.format = 32;
+                ev.xclient.data.l[0] = wm_delete_window;
+                ev.xclient.data.l[1] = CurrentTime;
+                XSendEvent(dpy, w, False, NoEventMask, &ev);
+                XFree(protocols);
+                return;
+            }
+        }
+        XFree(protocols);
+    }
+
+    // Fallback: kill the client
+    XKillClient(dpy, w);
+}
+
+int main() {
+    remove("/tmp/diamondwm_debug.log");
+    debug_log("=== Modern DiamondWM Starting ===");
+
+    dpy = XOpenDisplay(NULL);
+    if (!dpy) {
+        debug_log("ERROR: Cannot open display");
+        fprintf(stderr, "Cannot open display\n");
+        exit(1);
+    }
+
+    screen = DefaultScreen(dpy);
+    root = RootWindow(dpy, screen);
+
+    // Modern color palette
+    black = BlackPixel(dpy, screen);
+    white = WhitePixel(dpy, screen);
+    dark_gray = 0x202020;
+    light_gray = 0x404040;
+    red = 0xFF4444;
+    dark_blue = 0x1b1b2c;
+    titlebar_gray = 0x2D2D2D;
+    titlebar_active = 0x3D3D3D;
+    button_red = 0xFF4444;
+    button_yellow = 0xFFAA00;
+    button_green = 0x44FF44;
+    purple_color = 0x8A2BE2;
+    menu_bg = 0x2D2D3D;
+    menu_hover_bg = 0x3D3D4D;
+    accent_color = 0x6C5CE7;
+    shadow_color = 0x101010;
+    bg_gradient_start = 0x0a0a1a;
+    bg_gradient_end = 0x1a1a2a;
+
+    // Create GCs with modern colors
+    XGCValues gv;
+    gv.foreground = light_gray;
+    gv.background = black;
+    gv.line_width = BORDER_WIDTH;
+    gc = XCreateGC(dpy, root, GCForeground | GCBackground | GCLineWidth, &gv);
+
+    XGCValues title_gv;
+    title_gv.foreground = titlebar_gray;
+    title_gv.background = titlebar_gray;
+    title_gc = XCreateGC(dpy, root, GCForeground | GCBackground, &title_gv);
+
+    set_background();
+
+    XGCValues text_gv;
+    text_gv.foreground = white;
+    text_gv.background = titlebar_gray;
+    text_gv.font = XLoadFont(dpy, "fixed");
+    text_gc = XCreateGC(dpy, root, GCForeground | GCBackground | GCFont, &text_gv);
+
+    XGCValues panel_gv;
+    panel_gv.foreground = white;
+    panel_gv.background = dark_blue;
+    panel_gv.font = XLoadFont(dpy, "fixed");
+    panel_gc = XCreateGC(dpy, root, GCForeground | GCBackground | GCFont, &panel_gv);
+
+    XGCValues menu_gv;
+    menu_gv.foreground = white;
+    menu_gv.background = menu_bg;
+    menu_gv.font = XLoadFont(dpy, "fixed");
+    menu_gc = XCreateGC(dpy, root, GCForeground | GCBackground | GCFont, &menu_gv);
+
+    XGCValues close_gv;
+    close_gv.foreground = button_red;
+    close_gv.background = titlebar_gray;
+    close_gc = XCreateGC(dpy, root, GCForeground | GCBackground, &close_gv);
+
+    XGCValues minimize_gv;
+    minimize_gv.foreground = button_yellow;
+    minimize_gv.background = titlebar_gray;
+    minimize_gc = XCreateGC(dpy, root, GCForeground | GCBackground, &minimize_gv);
+
+    XGCValues maximize_gv;
+    maximize_gv.foreground = button_green;
+    maximize_gv.background = titlebar_gray;
+    maximize_gc = XCreateGC(dpy, root, GCForeground | GCBackground, &maximize_gv);
+
+    XGCValues button_gv;
+    button_gv.foreground = light_gray;
+    button_gv.background = titlebar_gray;
+    button_gc = XCreateGC(dpy, root, GCForeground | GCBackground, &button_gv);
+
+    XSelectInput(dpy, root,
+        SubstructureRedirectMask | SubstructureNotifyMask |
+        ButtonPressMask | ButtonReleaseMask | PointerMotionMask | KeyPressMask);
+
+    create_panel();
+    create_menu();
+    create_app_launcher();
+    setup_mouse_cursor();
+
+    XGrabKey(dpy, XKeysymToKeycode(dpy, XK_F11), 0, root, True, GrabModeAsync, GrabModeAsync);
+    XGrabKey(dpy, XKeysymToKeycode(dpy, XK_F12), 0, root, True, GrabModeAsync, GrabModeAsync);
+    XGrabKey(dpy, XKeysymToKeycode(dpy, XK_Escape), ControlMask, root, True, GrabModeAsync, GrabModeAsync);
+
+    debug_log("Modern DiamondWM initialization complete");
+    printf("Modern DiamondWM started with enhanced visual effects!\n");
+    printf("Features: Rounded corners, shadows, gradients, animations, hover effects!\n");
+    printf("Controls: F11=Fullscreen, F12=Lower window, Ctrl+Esc=Close window\n");
+    printf("Click window buttons: Red=Close, Yellow=Minimize, Green=Maximize\n");
+    printf("Drag titlebar to move windows! Drag edges to resize!\n");
+    printf("Click DiamondWM text on panel to show system menu!\n");
+    printf("LEFT-click desktop background to show application launcher!\n");
+    printf("RIGHT-click desktop background to always show application launcher!\n");
+    printf("Check /tmp/diamondwm_debug.log for detailed logs\n");
+
+    // Main event loop
+    XEvent ev;
+    int event_count = 0;
+
+    while (1) {
+        check_clock_update();
+
+        if (XPending(dpy)) {
+            XNextEvent(dpy, &ev);
+            event_count++;
+
+            if (event_count % 20 == 0) {
+                debug_log("Event #%d: type=%d", event_count, ev.type);
+            }
+
+            switch (ev.type) {
+                case MapRequest:
+                    debug_log("MapRequest event for window %lu", ev.xmaprequest.window);
+                    manage_window(ev.xmaprequest.window);
+                    XMapWindow(dpy, ev.xmaprequest.window);
+                    break;
+
+                case UnmapNotify:
+                    debug_log("UnmapNotify event for window %lu", ev.xunmap.window);
+                    unmanage_window(ev.xunmap.window);
+                    break;
+
+                case DestroyNotify:
+                    debug_log("DestroyNotify event for window %lu", ev.xdestroywindow.window);
+                    for (int i = 0; i < client_count; i++) {
+                        if (clients[i] && clients[i]->win == ev.xdestroywindow.window) {
+                            debug_log("Client window %lu destroyed, destroying frame %lu",
+                                     clients[i]->win, clients[i]->frame);
+                            Window frame = clients[i]->frame;
+                            unmanage_window(clients[i]->win);
+                            XDestroyWindow(dpy, frame);
+                            XFlush(dpy);
+                            break;
+                        }
+                    }
+                    break;
+
+                case ButtonPress:
+                    if (ev.xbutton.window == root) {
+                        if (ev.xbutton.button == Button1) {
+                            if (!app_launcher.visible && !menu.visible) {
+                                debug_log("Desktop background LEFT clicked at %d,%d - showing app launcher",
+                                         ev.xbutton.x_root, ev.xbutton.y_root);
+                                show_app_launcher(ev.xbutton.x_root, ev.xbutton.y_root);
+                            } else {
+                                handle_button_press(&ev.xbutton);
+                            }
+                        } else if (ev.xbutton.button == Button3) {
+                            debug_log("Desktop background RIGHT clicked at %d,%d - showing app launcher",
+                                     ev.xbutton.x_root, ev.xbutton.y_root);
+                            show_app_launcher(ev.xbutton.x_root, ev.xbutton.y_root);
+                        }
+                    } else {
+                        handle_button_press(&ev.xbutton);
+                    }
+                    break;
+
+                case ButtonRelease:
+                    handle_button_release(&ev.xbutton);
+                    break;
+
+                case MotionNotify:
+                    handle_motion_notify(&ev.xmotion);
+                    break;
+
+                case KeyPress:
+                    handle_key_press(&ev.xkey);
+                    break;
+
+                case ConfigureRequest:
+                    {
+                        XConfigureRequestEvent *cre = &ev.xconfigurerequest;
+                        XWindowChanges wc;
+                        wc.x = cre->x;
+                        wc.y = cre->y;
+                        wc.width = cre->width;
+                        wc.height = cre->height;
+                        wc.border_width = cre->border_width;
+                        wc.sibling = cre->above;
+                        wc.stack_mode = cre->detail;
+                        XConfigureWindow(dpy, cre->window, cre->value_mask, &wc);
+                    }
+                    break;
+
+                case Expose:
+                    if (ev.xexpose.window == panel.win) {
+                        draw_panel();
+                    } else if (ev.xexpose.window == menu.win) {
+                        draw_menu();
+                    } else if (ev.xexpose.window == app_launcher.win) {
+                        draw_app_launcher();
+                    } else {
+                        for (int i = 0; i < client_count; i++) {
+                            if (clients[i] && clients[i]->frame == ev.xexpose.window) {
+                                draw_window_decorations(clients[i]);
+                                break;
+                            }
+                        }
+                    }
+                    break;
+
+                default:
+                    break;
+            }
+        } else {
+            usleep(100000);
+        }
+    }
+
+    free_applications();
+    debug_log("=== Modern DiamondWM Exiting ===");
+    XCloseDisplay(dpy);
+    return 0;
 }
