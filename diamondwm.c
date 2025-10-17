@@ -980,6 +980,9 @@ void show_app_launcher(int x, int y) {
             app_launcher.y = screen_height - app_launcher.height - 10;
         }
 
+        debug_log("show_app_launcher: positioning at %d,%d (clicked at %d,%d)",
+                 app_launcher.x, app_launcher.y, x, y);
+
         XMoveWindow(dpy, app_launcher.win, app_launcher.x, app_launcher.y);
         XMapWindow(dpy, app_launcher.win);
         app_launcher.visible = 1;
@@ -1082,8 +1085,15 @@ void draw_app_launcher() {
 int is_in_app_launcher_area(int x, int y) {
     if (!app_launcher.visible) return 0;
 
-    return (x >= app_launcher.x && x <= app_launcher.x + app_launcher.width &&
-            y >= app_launcher.y && y <= app_launcher.y + app_launcher.height);
+    int result = (x >= app_launcher.x && x <= app_launcher.x + app_launcher.width &&
+                 y >= app_launcher.y && y <= app_launcher.y + app_launcher.height);
+
+    debug_log("is_in_app_launcher_area: checking %d,%d against [%d,%d - %d,%d] -> %d",
+             x, y, app_launcher.x, app_launcher.y,
+             app_launcher.x + app_launcher.width, app_launcher.y + app_launcher.height,
+             result);
+
+    return result;
 }
 
 int get_app_launcher_item_at(int x, int y) {
@@ -1092,12 +1102,19 @@ int get_app_launcher_item_at(int x, int y) {
     int relative_x = x - app_launcher.x;
     int relative_y = y - app_launcher.y;
 
+    debug_log("get_app_launcher_item_at: abs(%d,%d) -> rel(%d,%d) in window %dx%d",
+             x, y, relative_x, relative_y, app_launcher.width, app_launcher.height);
+
     if (relative_x < 0 || relative_x > app_launcher.width ||
         relative_y < 0 || relative_y > app_launcher.height) {
+        debug_log("  -> Outside app launcher bounds");
         return -1;
     }
 
-    if (relative_y < 35) return -1;
+    if (relative_y < 35) {
+        debug_log("  -> In title area (y=%d)", relative_y);
+        return -1;
+    }
 
     int y_pos = 40;
     int category_index = 0;
@@ -1106,15 +1123,20 @@ int get_app_launcher_item_at(int x, int y) {
         AppCategory *cat = &app_launcher.categories[i];
         if (cat->app_count == 0) continue;
 
+        debug_log("  Checking category %s at y_pos=%d", cat->category_name, y_pos);
+
         if (relative_y >= y_pos && relative_y <= y_pos + 20) {
-            return category_index;
+            debug_log("  -> Clicked category %d: %s", category_index, cat->category_name);
+            return category_index << 16;
         }
         y_pos += 25;
 
         if (cat->expanded) {
             for (int j = 0; j < cat->app_count; j++) {
+                debug_log("    Checking app %s at y_pos=%d", cat->apps[j].name, y_pos);
                 if (relative_y >= y_pos && relative_y <= y_pos + 20) {
-                    return (i << 16) | (j + 1);
+                    debug_log("    -> Clicked app %d in category %d", j, category_index);
+                    return (category_index << 16) | (j + 1);
                 }
                 y_pos += 20;
             }
@@ -1122,8 +1144,11 @@ int get_app_launcher_item_at(int x, int y) {
 
         y_pos += 5;
         category_index++;
+
+        if (y_pos > app_launcher.height - 20) break;
     }
 
+    debug_log("  -> No item found at relative_y=%d", relative_y);
     return -1;
 }
 
@@ -1435,13 +1460,15 @@ void handle_button_press(XButtonEvent *e) {
 
     // ===== Check for app launcher visibility FIRST =====
     if (app_launcher.visible) {
-        if (e->window == app_launcher.win) {
+        debug_log("App launcher visible, checking if click is inside...");
+        if (is_in_app_launcher_area(e->x_root, e->y_root)) {
+            debug_log("Click INSIDE app launcher at %d,%d", e->x_root, e->y_root);
             // Click on app launcher itself - handle normally
             handle_app_launcher_click(e->x_root, e->y_root);
             return;
         } else {
+            debug_log("Click OUTSIDE app launcher at %d,%d", e->x_root, e->y_root);
             // Click outside app launcher - close it
-            debug_log("Click outside app launcher - hiding it");
             hide_app_launcher();
             // Don't return here - let the click be processed by other handlers
         }
@@ -1830,7 +1857,7 @@ void handle_motion_notify(XMotionEvent *e) {
     }
 
     // Handle hover effects for app launcher
-    if (app_launcher.visible && e->window == app_launcher.win) {
+    if (app_launcher.visible) {
         int new_hover_item = get_app_launcher_item_at(e->x_root, e->y_root);
         if (app_launcher.hover_item != new_hover_item) {
             app_launcher.hover_item = new_hover_item;
@@ -2248,6 +2275,18 @@ int main() {
     create_panel();
     create_menu();
     create_app_launcher();
+
+    debug_log("App launcher created with %d categories", app_launcher.category_count);
+    for (int i = 0; i < app_launcher.category_count; i++) {
+        if (app_launcher.categories[i].app_count > 0) {
+            debug_log("Category %s has %d apps",
+                     app_launcher.categories[i].category_name,
+                     app_launcher.categories[i].app_count);
+        }
+    }
+
+    debug_log("Application launcher created");
+
     setup_mouse_cursor();
 
     XGrabKey(dpy, XKeysymToKeycode(dpy, XK_F11), 0, root, True, GrabModeAsync, GrabModeAsync);
