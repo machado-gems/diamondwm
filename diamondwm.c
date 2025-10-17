@@ -109,6 +109,10 @@ unsigned long titlebar_gray, titlebar_active, button_red, button_yellow, button_
 unsigned long menu_bg, menu_hover_bg, accent_color, shadow_color;
 unsigned long bg_gradient_start, bg_gradient_end;
 
+// Enhanced color scheme
+unsigned long accent_light, background_dark, background_light;
+unsigned long text_primary, text_secondary;
+
 typedef struct {
     char *name;
     char *exec;
@@ -133,6 +137,8 @@ typedef struct {
     int category_count;
     int hover_item;
     float alpha;
+    char search_text[256];
+    int search_mode;
 } AppLauncherMenu;
 
 AppLauncherMenu app_launcher;
@@ -188,6 +194,7 @@ void animate_window_resize(Client *c, int target_w, int target_h);
 void draw_gradient_rect(Drawable d, GC gc, int x, int y, int w, int h, unsigned long c1, unsigned long c2, int vertical);
 void draw_glow_button(Drawable d, int x, int y, int size, unsigned long color, int hover);
 void update_button_hover(Client *c, int x, int y);
+void show_operation_feedback(const char* message);
 
 void set_background() {
     system("feh --bg-scale /usr/share/backgrounds/* 2>/dev/null &");
@@ -215,6 +222,32 @@ void set_background() {
 
     XFreeGC(dpy, bg_gc);
     XFreePixmap(dpy, bg_pixmap);
+}
+
+void show_operation_feedback(const char* message) {
+    // Create a temporary toast notification
+    Window toast = XCreateSimpleWindow(dpy, root,
+                                      DisplayWidth(dpy, screen)/2 - 100,
+                                      DisplayHeight(dpy, screen)/2,
+                                      200, 40, 0, accent_color, background_dark);
+    XSelectInput(dpy, toast, ExposureMask);
+    XMapWindow(dpy, toast);
+
+    // Draw message
+    XGCValues toast_gc_vals;
+    toast_gc_vals.foreground = text_primary;
+    toast_gc_vals.background = background_dark;
+    toast_gc_vals.font = XLoadFont(dpy, "fixed");
+    GC toast_gc = XCreateGC(dpy, toast, GCForeground | GCBackground | GCFont, &toast_gc_vals);
+
+    XSetForeground(dpy, toast_gc, text_primary);
+    XDrawString(dpy, toast, toast_gc, 10, 25, message, strlen(message));
+    XFlush(dpy);
+
+    // Auto-hide after delay
+    usleep(1500000);
+    XDestroyWindow(dpy, toast);
+    XFreeGC(dpy, toast_gc);
 }
 
 void draw_gradient_rect(Drawable d, GC gc, int x, int y, int w, int h, unsigned long c1, unsigned long c2, int vertical) {
@@ -275,19 +308,20 @@ void animate_window_move(Client *c, int target_x, int target_y) {
     int start_x = c->x;
     int start_y = c->y;
 
+    // Use cubic easing for smoother animation
     for (int step = 1; step <= ANIMATION_STEPS; step++) {
-        float progress = (float)step / ANIMATION_STEPS;
-        // Ease-out curve
-        progress = 1 - (1 - progress) * (1 - progress);
+        float t = (float)step / ANIMATION_STEPS;
+        // Cubic ease-out
+        t--;
+        float progress = t*t*t + 1;
 
         int new_x = start_x + (int)((target_x - start_x) * progress);
         int new_y = start_y + (int)((target_y - start_y) * progress);
 
         XMoveWindow(dpy, c->frame, new_x, new_y);
         XFlush(dpy);
-        usleep(ANIMATION_DELAY);
+        usleep(ANIMATION_DELAY / ANIMATION_STEPS);
     }
-
     c->x = target_x;
     c->y = target_y;
 }
@@ -317,21 +351,27 @@ void animate_window_resize(Client *c, int target_w, int target_h) {
 }
 
 void draw_glow_button(Drawable d, int x, int y, int size, unsigned long color, int hover) {
-    // Draw glow effect if hovering
     if (hover) {
-        // Outer glow
-        for (int i = 2; i > 0; i--) {
-            int alpha = 100 - (i * 30);
-            unsigned long glow_color = color;
+        // Enhanced glow with multiple layers
+        for (int i = 3; i > 0; i--) {
+            int alpha = 120 - (i * 30);
+            // Simulate alpha by blending with background
+            int r = (color >> 16) & 0xFF;
+            int g = (color >> 8) & 0xFF;
+            int b = color & 0xFF;
+
+            // Blend with dark background
+            r = (r * alpha + 0x2D * (255 - alpha)) / 255;
+            g = (g * alpha + 0x2D * (255 - alpha)) / 255;
+            b = (b * alpha + 0x2D * (255 - alpha)) / 255;
+
+            unsigned long glow_color = (r << 16) | (g << 8) | b;
             XSetForeground(dpy, button_gc, glow_color);
 
-            XPoint glow[] = {
-                {x + size/2, y - i},
-                {x + size + i, y + size/2},
-                {x + size/2, y + size + i},
-                {x - i, y + size/2}
-            };
-            XDrawLines(dpy, d, button_gc, glow, 4, CoordModeOrigin);
+            XFillArc(dpy, d, button_gc,
+                    x - i, y - i,
+                    size + 2*i, size + 2*i,
+                    0, 360*64);
         }
     }
 
@@ -395,9 +435,11 @@ void draw_diamond_icon(int x, int y, int size) {
         {x, y + size/2}
     };
 
-    // Glow effect
+    // Enhanced glow effect
     for (int i = 3; i > 0; i--) {
-        XSetForeground(dpy, panel_gc, purple_color - (i * 0x111111));
+        int alpha = 100 - (i * 25);
+        unsigned long glow_color = purple_color - (i * 0x111111);
+        XSetForeground(dpy, panel_gc, glow_color);
         XPoint glow[] = {
             {x + size/2, y - i},
             {x + size + i, y + size/2},
@@ -412,7 +454,7 @@ void draw_diamond_icon(int x, int y, int size) {
     XFillPolygon(dpy, panel.win, panel_gc, diamond, 4, Convex, CoordModeOrigin);
 
     // Highlight
-    XSetForeground(dpy, panel_gc, 0xAA44FF);
+    XSetForeground(dpy, panel_gc, accent_light);
     XDrawLine(dpy, panel.win, panel_gc, x + size/2, y, x + size - 1, y + size/2 - 1);
 }
 
@@ -426,7 +468,7 @@ void draw_clock() {
     int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), time_str, strlen(time_str));
     int x = panel.width - text_width - 180;
 
-    XSetForeground(dpy, panel_gc, white);
+    XSetForeground(dpy, panel_gc, text_primary);
     XDrawString(dpy, panel.win, panel_gc, x, 30, time_str, strlen(time_str));
 }
 
@@ -525,7 +567,7 @@ void draw_menu() {
             XDrawLine(dpy, menu.win, menu_gc, 10, y, menu.width - 10, y);
         }
 
-        XSetForeground(dpy, menu_gc, white);
+        XSetForeground(dpy, menu_gc, text_primary);
         int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), items[i], strlen(items[i]));
         int text_x = (menu.width - text_width) / 2;
         int text_y = y + (MENU_ITEM_HEIGHT / 2) + 5;
@@ -954,6 +996,8 @@ void create_app_launcher() {
     app_launcher.y = 100;
     app_launcher.hover_item = -1;
     app_launcher.alpha = 0.0f;
+    app_launcher.search_mode = 0;
+    app_launcher.search_text[0] = '\0';
 
     app_launcher.win = XCreateSimpleWindow(dpy, root, app_launcher.x, app_launcher.y,
                                           app_launcher.width, app_launcher.height, 0,
@@ -1013,6 +1057,8 @@ void hide_app_launcher() {
         XUnmapWindow(dpy, app_launcher.win);
         app_launcher.visible = 0;
         app_launcher.hover_item = -1;
+        app_launcher.search_mode = 0;
+        app_launcher.search_text[0] = '\0';
         XUngrabPointer(dpy, CurrentTime);
     }
 }
@@ -1023,19 +1069,31 @@ void draw_app_launcher() {
     XClearWindow(dpy, app_launcher.win);
 
     // Modern background with rounded corners
-    XSetForeground(dpy, menu_gc, dark_blue);
+    XSetForeground(dpy, menu_gc, background_dark);
     draw_rounded_rectangle(app_launcher.win, menu_gc, 0, 0, app_launcher.width, app_launcher.height, CORNER_RADIUS);
 
     // Draw border with accent color
     XSetForeground(dpy, menu_gc, accent_color);
     XDrawRectangle(dpy, app_launcher.win, menu_gc, 1, 1, app_launcher.width - 3, app_launcher.height - 3);
 
-    // Draw title with gradient
-    XSetForeground(dpy, menu_gc, white);
-    XDrawString(dpy, app_launcher.win, menu_gc, 10, 20, "Applications", 12);
-    XDrawLine(dpy, app_launcher.win, menu_gc, 0, 25, app_launcher.width, 25);
+    // Draw search bar
+    XSetForeground(dpy, menu_gc, 0x3D3D4D);
+    XFillRectangle(dpy, app_launcher.win, menu_gc, 10, 10, app_launcher.width-20, 30);
 
-    int y_pos = 40;
+    XSetForeground(dpy, menu_gc, text_secondary);
+    if (app_launcher.search_text[0] == '\0') {
+        XDrawString(dpy, app_launcher.win, menu_gc, 20, 30, "Search applications...", 21);
+    } else {
+        XDrawString(dpy, app_launcher.win, menu_gc, 20, 30, app_launcher.search_text, strlen(app_launcher.search_text));
+    }
+
+    // Draw title with gradient
+    XSetForeground(dpy, menu_gc, text_primary);
+    XDrawString(dpy, app_launcher.win, menu_gc, 10, 55, "Applications", 12);
+    XSetForeground(dpy, menu_gc, 0x404040);
+    XDrawLine(dpy, app_launcher.win, menu_gc, 0, 60, app_launcher.width, 60);
+
+    int y_pos = 75;
 
     // Draw categories and apps with modern styling
     for (int i = 0; i < app_launcher.category_count; i++) {
@@ -1055,7 +1113,7 @@ void draw_app_launcher() {
                                   app_launcher.width - 30, 20, 4);
         }
 
-        XSetForeground(dpy, menu_gc, white);
+        XSetForeground(dpy, menu_gc, text_primary);
         XDrawString(dpy, app_launcher.win, menu_gc, 20, y_pos, category_text, strlen(category_text));
         y_pos += 25;
 
@@ -1069,7 +1127,7 @@ void draw_app_launcher() {
                                           app_launcher.width - 45, 20, 4);
                 }
 
-                XSetForeground(dpy, menu_gc, 0xCCCCCC);
+                XSetForeground(dpy, menu_gc, text_secondary);
                 XDrawString(dpy, app_launcher.win, menu_gc, 40, y_pos,
                            cat->apps[j].name, strlen(cat->apps[j].name));
                 y_pos += 20;
@@ -1111,12 +1169,18 @@ int get_app_launcher_item_at(int x, int y) {
         return -1;
     }
 
-    if (relative_y < 35) {
+    // Check if click is in search area
+    if (relative_y >= 10 && relative_y <= 40) {
+        debug_log("  -> In search area");
+        return -2; // Special value for search area
+    }
+
+    if (relative_y < 65) {
         debug_log("  -> In title area (y=%d)", relative_y);
         return -1;
     }
 
-    int y_pos = 40;
+    int y_pos = 75;
     int category_index = 0;
 
     for (int i = 0; i < app_launcher.category_count; i++) {
@@ -1159,6 +1223,16 @@ void handle_app_launcher_click(int x, int y) {
 
     if (item == -1) {
         hide_app_launcher();
+        return;
+    }
+
+    if (item == -2) {
+        // Clicked search area - toggle search mode
+        app_launcher.search_mode = !app_launcher.search_mode;
+        if (app_launcher.search_mode) {
+            show_operation_feedback("Search mode activated - type to search");
+        }
+        draw_app_launcher();
         return;
     }
 
@@ -1218,9 +1292,11 @@ void handle_app_launcher_click(int x, int y) {
                 execl("/bin/sh", "sh", "-c", app->exec, NULL);
                 exit(0);
             } else if (pid > 0) {
+                show_operation_feedback("Application launched");
                 hide_app_launcher();
             } else {
                 debug_log("ERROR: Failed to fork for application launch");
+                show_operation_feedback("Failed to launch application");
             }
         } else {
             debug_log("ERROR: Invalid app selection: cat_index=%d, actual_cat_index=%d, app_index=%d",
@@ -1292,29 +1368,33 @@ void draw_panel() {
 
     // Modern panel with gradient
     draw_gradient_rect(panel.win, panel_gc, 0, 0, panel.width, panel.height,
-                      dark_blue, 0x2D2D4D, 1);
+                      background_dark, background_light, 1);
 
     // Draw client icons/buttons with modern styling
     int x = 20;
-    XSetForeground(dpy, panel_gc, white);
+    XSetForeground(dpy, panel_gc, text_primary);
 
     for (int i = 0; i < client_count; i++) {
         if (clients[i] && clients[i]->is_mapped) {
             // Modern app icon with rounded corners
-            XSetForeground(dpy, panel_gc, 0x666666);
+            XSetForeground(dpy, panel_gc, 0x3D3D4D);
             draw_rounded_rectangle(panel.win, panel_gc, x, 10, 40, 30, 6);
 
             // Border with accent color for active window
             if (clients[i]->is_active) {
                 XSetForeground(dpy, panel_gc, accent_color);
+                XSetLineAttributes(dpy, panel_gc, 2, LineSolid, CapRound, JoinRound);
             } else {
-                XSetForeground(dpy, panel_gc, 0x888888);
+                XSetForeground(dpy, panel_gc, 0x555555);
+                XSetLineAttributes(dpy, panel_gc, 1, LineSolid, CapRound, JoinRound);
             }
             XDrawRectangle(dpy, panel.win, panel_gc, x, 10, 40, 30);
+            XSetLineAttributes(dpy, panel_gc, 1, LineSolid, CapRound, JoinRound);
 
             // Draw window identifier
             char label[10];
             snprintf(label, sizeof(label), "%d", i+1);
+            XSetForeground(dpy, panel_gc, clients[i]->is_active ? text_primary : text_secondary);
             XDrawString(dpy, panel.win, panel_gc, x + 15, 30, label, strlen(label));
             x += 50;
         }
@@ -1329,6 +1409,7 @@ void draw_panel() {
 
     int text_x = diamond_x + diamond_size + 5;
     int text_y = 30;
+    XSetForeground(dpy, panel_gc, text_primary);
     XDrawString(dpy, panel.win, panel_gc, text_x, text_y, "DiamondWM", 9);
 
     draw_clock();
@@ -1344,14 +1425,22 @@ void draw_window_decorations(Client *c) {
     // Draw shadow effect
     draw_shadow(c->frame, 0, 0, c->width, c->height);
 
-    // Draw titlebar with gradient based on active state
+    // Enhanced window activation feedback
     if (c->is_active) {
+        // Brighter gradient and border for active window
         draw_gradient_rect(c->frame, title_gc, 0, 0, c->width, TITLEBAR_HEIGHT,
-                          titlebar_active, 0x4D4D4D, 1);
+                          accent_color, 0x5D5D7D, 1);
+        XSetForeground(dpy, gc, accent_color);
+        XSetLineAttributes(dpy, gc, 2, LineSolid, CapRound, JoinRound);
     } else {
+        // More subtle for inactive windows
         draw_gradient_rect(c->frame, title_gc, 0, 0, c->width, TITLEBAR_HEIGHT,
-                          titlebar_gray, 0x3D3D3D, 1);
+                          titlebar_gray, 0x2D2D2D, 1);
+        XSetForeground(dpy, gc, 0x606060);
+        XSetLineAttributes(dpy, gc, 1, LineSolid, CapRound, JoinRound);
     }
+    XDrawRectangle(dpy, c->frame, gc, 0, 0, c->width - 1, c->height - 1);
+    XSetLineAttributes(dpy, gc, 1, LineSolid, CapRound, JoinRound);
 
     // Draw window title
     if (c->title) {
@@ -1373,10 +1462,10 @@ void draw_window_decorations(Client *c) {
 
         int title_y = TITLEBAR_HEIGHT / 2 + 5;
 
-        XSetForeground(dpy, text_gc, c->is_active ? white : 0xCCCCCC);
+        XSetForeground(dpy, text_gc, c->is_active ? text_primary : text_secondary);
         XDrawString(dpy, c->frame, text_gc, title_x, title_y, display_title, strlen(display_title));
     } else {
-        XSetForeground(dpy, text_gc, c->is_active ? white : 0xCCCCCC);
+        XSetForeground(dpy, text_gc, c->is_active ? text_primary : text_secondary);
         XDrawString(dpy, c->frame, text_gc, 80, TITLEBAR_HEIGHT / 2 + 5, "Untitled", 8);
     }
 
@@ -1391,14 +1480,6 @@ void draw_window_decorations(Client *c) {
 
     // Maximize button with hover effect
     draw_glow_button(c->frame, 15 + 2*(BUTTON_SIZE + BUTTON_SPACING), button_y, BUTTON_SIZE, button_green, c->button_hover == 3);
-
-    // Draw window border with accent color for active window
-    if (c->is_active) {
-        XSetForeground(dpy, gc, accent_color);
-    } else {
-        XSetForeground(dpy, gc, light_gray);
-    }
-    XDrawRectangle(dpy, c->frame, gc, 0, 0, c->width - 1, c->height - 1);
 
     // Draw separator between titlebar and content
     XSetForeground(dpy, gc, 0x404040);
@@ -1447,6 +1528,34 @@ int get_resize_edge(Client *c, int x, int y) {
     return -1; // not on resize edge
 }
 
+void send_wm_delete(Window w) {
+    Atom wm_protocols = XInternAtom(dpy, "WM_PROTOCOLS", False);
+    Atom wm_delete_window = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
+    Atom *protocols;
+    int num_protocols;  // Changed from unsigned long to int
+
+    if (XGetWMProtocols(dpy, w, &protocols, &num_protocols)) {
+        for (int i = 0; i < num_protocols; i++) {  // Changed from unsigned long to int
+            if (protocols[i] == wm_delete_window) {
+                XEvent ev;
+                ev.type = ClientMessage;
+                ev.xclient.window = w;
+                ev.xclient.message_type = wm_protocols;
+                ev.xclient.format = 32;
+                ev.xclient.data.l[0] = wm_delete_window;
+                ev.xclient.data.l[1] = CurrentTime;
+                XSendEvent(dpy, w, False, NoEventMask, &ev);
+                XFree(protocols);
+                return;
+            }
+        }
+        XFree(protocols);
+    }
+
+    // Fallback: kill the client
+    XKillClient(dpy, w);
+}
+
 void handle_button_press(XButtonEvent *e) {
     debug_log("Button press on window %lu (button=%d) at screen coords %d,%d",
              e->window, e->button, e->x_root, e->y_root);
@@ -1493,14 +1602,17 @@ void handle_button_press(XButtonEvent *e) {
                         debug_log("Terminal clicked - launching xterm");
                         hide_menu();
                         system("xterm &");
+                        show_operation_feedback("Terminal launched");
                         return;
                     case 1: // Lock
                         debug_log("Lock clicked - not implemented");
                         hide_menu();
+                        show_operation_feedback("Lock screen not implemented");
                         return;
                     case 2: // Logout
                         debug_log("Logout clicked - exiting window manager");
                         hide_menu();
+                        show_operation_feedback("Logging out...");
                         for (int i = 0; i < client_count; i++) {
                             if (clients[i]) {
                                 XUnmapWindow(dpy, clients[i]->frame);
@@ -1514,6 +1626,7 @@ void handle_button_press(XButtonEvent *e) {
                     case 3: // Shutdown
                         debug_log("Shutdown clicked - calling system shutdown");
                         hide_menu();
+                        show_operation_feedback("Shutting down...");
                         system("shutdown -h now");
                         return;
                 }
@@ -1582,6 +1695,9 @@ void handle_button_press(XButtonEvent *e) {
 
                     XRaiseWindow(dpy, clients[i]->frame);
                     XSetInputFocus(dpy, clients[i]->win, RevertToPointerRoot, CurrentTime);
+                    clients[i]->is_active = 1;
+                    draw_window_decorations(clients[i]);
+                    show_operation_feedback("Window activated");
                     break;
                 }
                 x += 50;
@@ -1630,20 +1746,25 @@ void handle_button_press(XButtonEvent *e) {
             if (is_in_titlebar(c, e->x, e->y)) {
                 if (is_in_close_button(c, e->x, e->y)) {
                     debug_log("Close button clicked");
+                    show_operation_feedback("Closing window...");
                     close_window(c);
                     return;
                 } else if (is_in_minimize_button(c, e->x, e->y)) {
                     debug_log("Minimize button clicked");
+                    show_operation_feedback("Window minimized");
                     lower_window(c);
                     return;
                 } else if (is_in_maximize_button(c, e->x, e->y)) {
                     debug_log("Maximize button clicked");
+                    show_operation_feedback(c->is_fullscreen ? "Window restored" : "Window maximized");
                     toggle_fullscreen(c);
                     return;
                 } else {
                     debug_log("Titlebar clicked - starting window drag");
                     XRaiseWindow(dpy, c->frame);
                     XSetInputFocus(dpy, c->win, RevertToPointerRoot, CurrentTime);
+                    c->is_active = 1;
+                    draw_window_decorations(c);
 
                     window_dragging = 1;
                     dragged_client = c;
@@ -1674,6 +1795,21 @@ void handle_button_release(XButtonEvent *e) {
 
     if (window_dragging && dragged_client) {
         debug_log("Window dragging ended for client %lu", dragged_client->win);
+
+        // Add window snapping
+        int snap_threshold = 20;
+        int screen_width = DisplayWidth(dpy, screen);
+        int screen_height = DisplayHeight(dpy, screen);
+
+        if (dragged_client->x < snap_threshold) dragged_client->x = 0;
+        if (dragged_client->y < snap_threshold) dragged_client->y = 0;
+        if (screen_width - (dragged_client->x + dragged_client->width) < snap_threshold)
+            dragged_client->x = screen_width - dragged_client->width;
+        if (screen_height - (dragged_client->y + dragged_client->height) < snap_threshold)
+            dragged_client->y = screen_height - dragged_client->height - PANEL_HEIGHT;
+
+        XMoveWindow(dpy, dragged_client->frame, dragged_client->x, dragged_client->y);
+
         window_dragging = 0;
 
         // Restore normal cursor
@@ -1696,23 +1832,31 @@ void handle_button_release(XButtonEvent *e) {
 }
 
 void handle_motion_notify(XMotionEvent *e) {
+    static int last_x = 0, last_y = 0;
+    static int panel_hover_index = -1;
 
-  static int last_x = 0, last_y = 0;
+    // Handle panel hover effects
+    if (e->window == panel.win) {
+        int new_hover_index = -1;
+        int x = 20;
+        for (int i = 0; i < client_count; i++) {
+            if (clients[i] && clients[i]->is_mapped) {
+                if (e->x >= x && e->x <= x + 40 && e->y >= 10 && e->y <= 40) {
+                    new_hover_index = i;
+                    break;
+                }
+                x += 50;
+            }
+        }
 
-    // Handle panel dragging
-    // if (panel_dragging && e->window == panel.win) {
-    //     int delta_x = e->x_root - drag_start_x;
-    //     int delta_y = e->x_root - drag_start_y;
-    //
-    //     // Move panel
-    //     panel.x += delta_x;
-    //     panel.y += delta_y;
-    //
-    //     XMoveWindow(dpy, panel.win, panel.x, panel.y);
-    //
-    //     drag_start_x = e->x_root;
-    //     drag_start_y = e->y_root;
-    // }
+        if (new_hover_index != panel_hover_index) {
+            panel_hover_index = new_hover_index;
+            if (panel_hover_index != -1) {
+                // Draw highlight for hovered panel button
+                draw_panel();
+            }
+        }
+    }
 
     // Handle window dragging
     if (window_dragging && dragged_client) {
@@ -1910,15 +2054,18 @@ void handle_key_press(XKeyEvent *e) {
     switch (keysym) {
         case XK_F11:
             debug_log("F11 pressed - toggling fullscreen");
+            show_operation_feedback(c->is_fullscreen ? "Exiting fullscreen" : "Entering fullscreen");
             toggle_fullscreen(c);
             break;
         case XK_F12:
             debug_log("F12 pressed - lowering window");
+            show_operation_feedback("Window lowered");
             lower_window(c);
             break;
         case XK_Escape:
             if (e->state & ControlMask) {
                 debug_log("Ctrl+Esc pressed - closing window");
+                show_operation_feedback("Closing window");
                 XKillClient(dpy, c->win);
             }
             break;
@@ -2008,6 +2155,8 @@ void manage_window(Window w) {
 
     // Redraw panel to show new window
     draw_panel();
+
+    show_operation_feedback("New window managed");
 }
 
 void unmanage_window(Window w) {
@@ -2151,6 +2300,8 @@ void move_window(Client *c, int x, int y) {
 
 void lower_window(Client *c) {
     XLowerWindow(dpy, c->frame);
+    c->is_active = 0;
+    draw_window_decorations(c);
     draw_panel();
 }
 
@@ -2181,33 +2332,7 @@ Client* find_client(Window w) {
     return NULL;
 }
 
-void send_wm_delete(Window w) {
-    Atom wm_protocols = XInternAtom(dpy, "WM_PROTOCOLS", False);
-    Atom wm_delete_window = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-    Atom *protocols;
-    int num_protocols;  // Changed from unsigned long to int
 
-    if (XGetWMProtocols(dpy, w, &protocols, &num_protocols)) {
-        for (int i = 0; i < num_protocols; i++) {  // Changed from unsigned long to int
-            if (protocols[i] == wm_delete_window) {
-                XEvent ev;
-                ev.type = ClientMessage;
-                ev.xclient.window = w;
-                ev.xclient.message_type = wm_protocols;
-                ev.xclient.format = 32;
-                ev.xclient.data.l[0] = wm_delete_window;
-                ev.xclient.data.l[1] = CurrentTime;
-                XSendEvent(dpy, w, False, NoEventMask, &ev);
-                XFree(protocols);
-                return;
-            }
-        }
-        XFree(protocols);
-    }
-
-    // Fallback: kill the client
-    XKillClient(dpy, w);
-}
 
 int main() {
     remove("/tmp/diamondwm_debug.log");
@@ -2223,7 +2348,7 @@ int main() {
     screen = DefaultScreen(dpy);
     root = RootWindow(dpy, screen);
 
-    // Modern color palette
+    // Enhanced modern color palette
     black = BlackPixel(dpy, screen);
     white = WhitePixel(dpy, screen);
     dark_gray = 0x202020;
@@ -2243,6 +2368,13 @@ int main() {
     bg_gradient_start = 0x0a0a1a;
     bg_gradient_end = 0x1a1a2a;
 
+    // New enhanced colors
+    accent_light = 0x897DEA;
+    background_dark = 0x0F0F1A;
+    background_light = 0x1E1E2E;
+    text_primary = 0xE0E0E0;
+    text_secondary = 0x888888;
+
     // Create GCs with modern colors
     XGCValues gv;
     gv.foreground = light_gray;
@@ -2258,19 +2390,19 @@ int main() {
     set_background();
 
     XGCValues text_gv;
-    text_gv.foreground = white;
+    text_gv.foreground = text_primary;
     text_gv.background = titlebar_gray;
     text_gv.font = XLoadFont(dpy, "fixed");
     text_gc = XCreateGC(dpy, root, GCForeground | GCBackground | GCFont, &text_gv);
 
     XGCValues panel_gv;
-    panel_gv.foreground = white;
+    panel_gv.foreground = text_primary;
     panel_gv.background = dark_blue;
     panel_gv.font = XLoadFont(dpy, "fixed");
     panel_gc = XCreateGC(dpy, root, GCForeground | GCBackground | GCFont, &panel_gv);
 
     XGCValues menu_gv;
-    menu_gv.foreground = white;
+    menu_gv.foreground = text_primary;
     menu_gv.background = menu_bg;
     menu_gv.font = XLoadFont(dpy, "fixed");
     menu_gc = XCreateGC(dpy, root, GCForeground | GCBackground | GCFont, &menu_gv);
