@@ -114,6 +114,18 @@ unsigned long accent_light, background_dark, background_light;
 unsigned long text_primary, text_secondary;
 
 typedef struct {
+    Window win;
+    int visible;
+    int x, y;
+    int width, height;
+    int hover_item;
+    float alpha;
+    Client *target_client;
+} WindowControlMenu;
+
+WindowControlMenu window_control_menu;
+
+typedef struct {
     char *name;
     char *exec;
     char *icon;
@@ -195,6 +207,10 @@ void draw_gradient_rect(Drawable d, GC gc, int x, int y, int w, int h, unsigned 
 void draw_glow_button(Drawable d, int x, int y, int size, unsigned long color, int hover);
 void update_button_hover(Client *c, int x, int y);
 void show_operation_feedback(const char* message);
+void create_window_control_menu();
+void show_window_control_menu(int x, int y, Client *c);
+void hide_window_control_menu();
+void draw_window_control_menu();
 
 void set_background() {
     system("feh --bg-scale /usr/share/backgrounds/* 2>/dev/null &");
@@ -1549,6 +1565,7 @@ void setup_mouse_cursor() {
     XDefineCursor(dpy, panel.win, cursor);
     XDefineCursor(dpy, menu.win, cursor);
     XDefineCursor(dpy, app_launcher.win, cursor);
+    XDefineCursor(dpy, window_control_menu.win, cursor);
 
     debug_log("Mouse cursor initialization complete");
 }
@@ -1773,6 +1790,48 @@ void handle_button_press(XButtonEvent *e) {
         }
     }
 
+    // ===== Check for window control menu =====
+    if (window_control_menu.visible) {
+        if (e->x_root >= window_control_menu.x &&
+            e->x_root <= window_control_menu.x + window_control_menu.width &&
+            e->y_root >= window_control_menu.y &&
+            e->y_root <= window_control_menu.y + window_control_menu.height) {
+
+            int relative_y = e->y_root - window_control_menu.y;
+            int item = relative_y / MENU_ITEM_HEIGHT;
+
+            debug_log("Window control menu clicked: item=%d", item);
+
+            if (item >= 0 && item < 3 && window_control_menu.target_client) {
+                Client *c = window_control_menu.target_client;
+                switch (item) {
+                    case 0: // Maximize
+                        debug_log("Maximize clicked");
+                        hide_window_control_menu();
+                        toggle_fullscreen(c);
+                        show_operation_feedback(c->is_fullscreen ? "Window maximized" : "Window restored");
+                        return;
+                    case 1: // Minimize
+                        debug_log("Minimize clicked");
+                        hide_window_control_menu();
+                        lower_window(c);
+                        show_operation_feedback("Window minimized");
+                        return;
+                    case 2: // Close
+                        debug_log("Close clicked");
+                        hide_window_control_menu();
+                        close_window(c);
+                        show_operation_feedback("Window closed");
+                        return;
+                }
+            }
+            hide_window_control_menu();
+            return;
+        } else {
+            hide_window_control_menu();
+        }
+    }
+
     // ===== Then check for menu visibility =====
     if (menu.visible) {
         // Check if click is inside menu area using root coordinates
@@ -1795,10 +1854,10 @@ void handle_button_press(XButtonEvent *e) {
                         show_operation_feedback("Terminal launched");
                         return;
                     case 1: // Lock
-                      debug_log("Lock clicked - locking screen");
-                      hide_menu();
-                      lock_screen();
-                      return;
+                        debug_log("Lock clicked - locking screen");
+                        hide_menu();
+                        lock_screen();
+                        return;
                     case 2: // Logout
                         debug_log("Logout clicked - exiting window manager");
                         hide_menu();
@@ -1855,18 +1914,24 @@ void handle_button_press(XButtonEvent *e) {
                 if (e->x >= x && e->x <= x + 40 && e->y >= 10 && e->y <= 40) {
                     debug_log("Panel button clicked for client %d", i);
 
-                    // Check if window is not visible and reposition it if needed
+                    // Left click - show control menu ABOVE this specific button
+                    if (e->button == Button1) {
+                        int menu_x = panel.x + x;
+                        int menu_y = panel.y;
+                        show_window_control_menu(menu_x, menu_y, clients[i]);
+                        return;
+                    }
+
+                    // Other buttons or right-click - existing behavior
                     if (!is_window_visible(clients[i])) {
                         debug_log("Window %d is not visible, repositioning to 10,10", i);
 
                         int screen_width = DisplayWidth(dpy, screen);
                         int screen_height = DisplayHeight(dpy, screen);
 
-                        // Calculate maximum size that fits on screen
                         int max_width = screen_width - 20;
                         int max_height = screen_height - PANEL_HEIGHT - 20;
 
-                        // Resize window to fit screen if it's too large
                         if (clients[i]->width > max_width || clients[i]->height > max_height) {
                             int new_width = (clients[i]->width > max_width) ? max_width : clients[i]->width;
                             int new_height = (clients[i]->height > max_height) ? max_height : clients[i]->height;
@@ -1877,7 +1942,6 @@ void handle_button_press(XButtonEvent *e) {
                             resize_window(clients[i], new_width, new_height);
                         }
 
-                        // Move window to top-left corner with 10px offset
                         move_window(clients[i], 10, 10);
                         debug_log("Window repositioned to 10,10 with size %dx%d",
                                  clients[i]->width, clients[i]->height);
@@ -1895,7 +1959,7 @@ void handle_button_press(XButtonEvent *e) {
         }
 
         // Start panel drag if clicked on empty area
-        if (e->button == Button1 && !menu.visible && !app_launcher.visible) {
+        if (e->button == Button1 && !menu.visible && !app_launcher.visible && !window_control_menu.visible) {
             panel_dragging = 1;
             drag_start_x = e->x_root;
             drag_start_y = e->y_root;
@@ -1961,7 +2025,7 @@ void handle_button_press(XButtonEvent *e) {
                     drag_win_start_x = c->x;
                     drag_win_start_y = c->y;
                     drag_offset_x = e->x_root - c->x;
-                    drag_offset_y = e->x_root - c->y;
+                    drag_offset_y = e->y_root - c->y;
 
                     debug_log("Window drag started: client=%lu, start_pos=%d,%d, offset=%d,%d",
                              c->win, drag_win_start_x, drag_win_start_y, drag_offset_x, drag_offset_y);
@@ -2214,6 +2278,22 @@ void handle_motion_notify(XMotionEvent *e) {
         } else if (menu.hover_item != -1) {
             menu.hover_item = -1;
             draw_menu();
+        }
+    }
+
+    // Handle hover effects for window control menu
+    if (window_control_menu.visible && e->window == window_control_menu.win) {
+        int relative_y = e->y;
+        int new_hover_item = relative_y / MENU_ITEM_HEIGHT;
+
+        if (new_hover_item >= 0 && new_hover_item < 3) {
+            if (window_control_menu.hover_item != new_hover_item) {
+                window_control_menu.hover_item = new_hover_item;
+                draw_window_control_menu();
+            }
+        } else if (window_control_menu.hover_item != -1) {
+            window_control_menu.hover_item = -1;
+            draw_window_control_menu();
         }
     }
 
@@ -2591,6 +2671,122 @@ Client* find_client(Window w) {
     return NULL;
 }
 
+void create_window_control_menu() {
+    window_control_menu.width = MENU_WIDTH;
+    window_control_menu.height = MENU_ITEM_HEIGHT * 3;
+    window_control_menu.x = 0;
+    window_control_menu.y = 0;
+    window_control_menu.hover_item = -1;
+    window_control_menu.alpha = 0.0f;
+    window_control_menu.target_client = NULL;
+
+    window_control_menu.win = XCreateSimpleWindow(dpy, root,
+                                                   window_control_menu.x,
+                                                   window_control_menu.y,
+                                                   window_control_menu.width,
+                                                   window_control_menu.height,
+                                                   0, white, dark_blue);
+
+    XSelectInput(dpy, window_control_menu.win, ButtonPressMask | ExposureMask | PointerMotionMask);
+    window_control_menu.visible = 0;
+}
+
+void show_window_control_menu(int x, int y, Client *c) {
+    if (!window_control_menu.visible && c) {
+        window_control_menu.target_client = c;
+
+        // Position ABOVE the panel button
+        window_control_menu.x = x;
+        window_control_menu.y = panel.y - window_control_menu.height - 5;
+
+        // Keep menu on screen horizontally
+        if (window_control_menu.x + window_control_menu.width > DisplayWidth(dpy, screen)) {
+            window_control_menu.x = DisplayWidth(dpy, screen) - window_control_menu.width;
+        }
+        if (window_control_menu.x < 0) {
+            window_control_menu.x = 0;
+        }
+
+        XMoveWindow(dpy, window_control_menu.win, window_control_menu.x, window_control_menu.y);
+        XMapWindow(dpy, window_control_menu.win);
+        XRaiseWindow(dpy, window_control_menu.win);
+        window_control_menu.visible = 1;
+
+        // Fade-in animation
+        for (int i = 0; i <= 10; i++) {
+            window_control_menu.alpha = (float)i / 10.0f;
+            draw_window_control_menu();
+            XFlush(dpy);
+            usleep(10000);
+        }
+
+        XGrabPointer(dpy, root, False, ButtonPressMask, GrabModeAsync,
+                    GrabModeAsync, None, None, CurrentTime);
+    }
+}
+
+void hide_window_control_menu() {
+    if (window_control_menu.visible) {
+        // Fade-out animation
+        for (int i = 10; i >= 0; i--) {
+            window_control_menu.alpha = (float)i / 10.0f;
+            draw_window_control_menu();
+            XFlush(dpy);
+            usleep(8000);
+        }
+
+        XUnmapWindow(dpy, window_control_menu.win);
+        window_control_menu.visible = 0;
+        window_control_menu.hover_item = -1;
+        window_control_menu.target_client = NULL;
+        XUngrabPointer(dpy, CurrentTime);
+    }
+}
+
+void draw_window_control_menu() {
+    if (!window_control_menu.visible) return;
+
+    XClearWindow(dpy, window_control_menu.win);
+
+    // Draw rounded background with gradient
+    XSetForeground(dpy, menu_gc, menu_bg);
+    draw_rounded_rectangle(window_control_menu.win, menu_gc, 0, 0,
+                          window_control_menu.width, window_control_menu.height,
+                          CORNER_RADIUS);
+
+    // Draw subtle border
+    XSetForeground(dpy, menu_gc, accent_color);
+    XDrawRectangle(dpy, window_control_menu.win, menu_gc, 1, 1,
+                   window_control_menu.width - 3, window_control_menu.height - 3);
+
+    char *items[] = {"Maximize", "Minimize", "Close"};
+
+    for (int i = 0; i < 3; i++) {
+        int y = i * MENU_ITEM_HEIGHT;
+
+        // Hover effect
+        if (window_control_menu.hover_item == i) {
+            XSetForeground(dpy, menu_gc, menu_hover_bg);
+            draw_rounded_rectangle(window_control_menu.win, menu_gc, 2, y + 2,
+                                  window_control_menu.width - 4, MENU_ITEM_HEIGHT - 4, 4);
+        }
+
+        if (i > 0) {
+            XSetForeground(dpy, menu_gc, 0x404040);
+            XDrawLine(dpy, window_control_menu.win, menu_gc, 10, y,
+                     window_control_menu.width - 10, y);
+        }
+
+        XSetForeground(dpy, menu_gc, text_primary);
+        int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), items[i], strlen(items[i]));
+        int text_x = (window_control_menu.width - text_width) / 2;
+        int text_y = y + (MENU_ITEM_HEIGHT / 2) + 5;
+
+        XDrawString(dpy, window_control_menu.win, menu_gc, text_x, text_y,
+                   items[i], strlen(items[i]));
+    }
+}
+
 
 
 int main() {
@@ -2693,6 +2889,7 @@ int main() {
     create_panel();
     create_menu();
     create_app_launcher();
+    create_window_control_menu();
 
     debug_log("App launcher created with %d categories", app_launcher.category_count);
     for (int i = 0; i < app_launcher.category_count; i++) {
@@ -2766,18 +2963,12 @@ int main() {
 
                 case ButtonPress:
                     if (ev.xbutton.window == root) {
-                        if (ev.xbutton.button == Button1) {
-                            if (!app_launcher.visible && !menu.visible) {
-                                debug_log("Desktop background LEFT clicked at %d,%d - showing app launcher",
-                                         ev.xbutton.x_root, ev.xbutton.y_root);
-                                show_app_launcher(ev.xbutton.x_root, ev.xbutton.y_root);
-                            } else {
-                                handle_button_press(&ev.xbutton);
-                            }
-                        } else if (ev.xbutton.button == Button3) {
+                        if (ev.xbutton.button == Button3) {
                             debug_log("Desktop background RIGHT clicked at %d,%d - showing app launcher",
                                      ev.xbutton.x_root, ev.xbutton.y_root);
                             show_app_launcher(ev.xbutton.x_root, ev.xbutton.y_root);
+                        } else {
+                            handle_button_press(&ev.xbutton);
                         }
                     } else {
                         handle_button_press(&ev.xbutton);
@@ -2822,6 +3013,8 @@ int main() {
                         draw_menu();
                     } else if (ev.xexpose.window == app_launcher.win) {
                         draw_app_launcher();
+                    } else if (ev.xexpose.window == window_control_menu.win) {
+                        draw_window_control_menu();
                     } else {
                         for (int i = 0; i < client_count; i++) {
                             if (clients[i] && clients[i]->frame == ev.xexpose.window) {
