@@ -223,6 +223,9 @@ void create_window_control_menu();
 void show_window_control_menu(int x, int y, Client *c);
 void hide_window_control_menu();
 void draw_window_control_menu();
+void draw_app_launcher_text(int x, int y, const char *text, unsigned long color, XftFont *font);
+void filter_applications_by_search();
+void lock_screen();
 
 // Xft font loading (for anti-aliased fonts)
 void load_xft_fonts() {
@@ -635,11 +638,22 @@ void draw_clock() {
 
     strftime(time_str, sizeof(time_str), "%H:%M", tm_info);
 
-    int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), time_str, strlen(time_str));
-    int x = panel.width - text_width - 180;
+    // Use anti-aliased font for clock
+    if (xft_fonts.regular) {
+        XGlyphInfo extents;
+        XftTextExtents8(dpy, xft_fonts.regular, (XftChar8 *)time_str, strlen(time_str), &extents);
+        int text_width = extents.width;
+        int x = 40 + panel.width - text_width - 180;
+        int y = 17;
 
-    XSetForeground(dpy, panel_gc, text_primary);
-    XDrawString(dpy, panel.win, panel_gc, x, 30, time_str, strlen(time_str));
+        draw_app_launcher_text(x, y, time_str, text_primary, xft_fonts.regular);
+    } else {
+        // Fallback
+        int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), time_str, strlen(time_str));
+        int x = panel.width - text_width - 180;
+        XSetForeground(dpy, panel_gc, text_primary);
+        XDrawString(dpy, panel.win, panel_gc, x, 30, time_str, strlen(time_str));
+    }
 }
 
 void check_clock_update() {
@@ -1158,21 +1172,41 @@ void load_applications() {
     debug_log("=== APPLICATION LOADING COMPLETE ===");
 }
 
+void draw_diamond_to_window(Window win, GC gc, int x, int y, int size) {
+    int center_x = x + size / 2;
+    int center_y = y + size / 2;
+    float scale_factor = size / 32.0f;
+
+    // Save original values
+    GC original_panel_gc = panel_gc;
+    Window original_panel_win = panel.win;
+
+    // Use provided window and GC
+    panel_gc = gc;
+    panel.win = win;
+
+    // Draw the diamond
+    draw_diamond_icon(x, y, size);
+
+    // Restore original values
+    panel_gc = original_panel_gc;
+    panel.win = original_panel_win;
+}
+
 void lock_screen() {
-    debug_log("Creating enhanced lock screen with diamond logo");
+    debug_log("Creating enhanced lock screen with modern diamond logo");
 
     // Create a fullscreen lock window
     Window lock_win = XCreateSimpleWindow(dpy, root, 0, 0,
                                          DisplayWidth(dpy, screen),
                                          DisplayHeight(dpy, screen),
-                                         0, black, black);
+                                         0, black, background_dark);
 
     // Create a GC for the lock screen
     XGCValues lock_gc_vals;
-    lock_gc_vals.foreground = white;
-    lock_gc_vals.background = black;
-    lock_gc_vals.font = XLoadFont(dpy, "fixed");
-    GC lock_gc = XCreateGC(dpy, lock_win, GCForeground | GCBackground | GCFont, &lock_gc_vals);
+    lock_gc_vals.foreground = text_primary;
+    lock_gc_vals.background = background_dark;
+    GC lock_gc = XCreateGC(dpy, lock_win, GCForeground | GCBackground, &lock_gc_vals);
 
     // Grab keyboard and pointer
     XGrabKeyboard(dpy, root, True, GrabModeAsync, GrabModeAsync, CurrentTime);
@@ -1188,56 +1222,70 @@ void lock_screen() {
     int center_x = screen_width / 2;
     int center_y = screen_height / 2;
 
-    // Draw large diamond logo (100x100 pixels)
-    int diamond_size = 100;
+    // Create Xft draw for anti-aliased text
+    XftDraw *lock_xft_draw = XftDrawCreate(dpy, lock_win,
+                                          DefaultVisual(dpy, screen),
+                                          DefaultColormap(dpy, screen));
+
+    // Draw modern diamond logo (same as panel) - manually draw since we can't use panel_gc
+    int diamond_size = 120;
     int diamond_x = center_x - diamond_size / 2;
-    int diamond_y = center_y - diamond_size / 2 - 60; // Offset up to make room for text
+    int diamond_y = center_y - diamond_size / 2 - 80;
 
-    XPoint diamond[] = {
-        {center_x, diamond_y},                           // top
-        {diamond_x + diamond_size, center_y - 60},      // right
-        {center_x, diamond_y + diamond_size},           // bottom
-        {diamond_x, center_y - 60}                      // left
-    };
+    // Draw the full diamond icon similar to panel but with lock screen dimensions
+    draw_diamond_to_window(lock_win, lock_gc, diamond_x, diamond_y, diamond_size);
 
-    // Draw glowing effect
-    for (int i = 5; i > 0; i--) {
-        int alpha = 150 - (i * 25);
-        unsigned long glow_color = purple_color - (i * 0x0F0F0F);
-        XSetForeground(dpy, lock_gc, glow_color);
+    // Draw "DiamondWM" text with anti-aliased font
+    char *title = "DiamondWM";
+    if (xft_fonts.title) {
+        XGlyphInfo extents;
+        XftTextExtents8(dpy, xft_fonts.title, (XftChar8 *)title, strlen(title), &extents);
+        int title_width = extents.width;
+        int title_x = center_x - title_width / 2;
+        int title_y = center_y + 40;
 
-        XPoint glow[] = {
-            {center_x, diamond_y - i},
-            {diamond_x + diamond_size + i, center_y - 60},
-            {center_x, diamond_y + diamond_size + i},
-            {diamond_x - i, center_y - 60}
-        };
-        XDrawLines(dpy, lock_win, lock_gc, glow, 4, CoordModeOrigin);
+        XRenderColor title_color;
+        title_color.red = ((text_primary >> 16) & 0xFF) * 257;
+        title_color.green = ((text_primary >> 8) & 0xFF) * 257;
+        title_color.blue = (text_primary & 0xFF) * 257;
+        title_color.alpha = 0xFFFF;
+
+        XftColor xft_title;
+        if (XftColorAllocValue(dpy, DefaultVisual(dpy, screen),
+                              DefaultColormap(dpy, screen),
+                              &title_color, &xft_title)) {
+            XftDrawStringUtf8(lock_xft_draw, &xft_title, xft_fonts.title,
+                             title_x, title_y + xft_fonts.title->ascent, (XftChar8 *)title, strlen(title));
+            XftColorFree(dpy, DefaultVisual(dpy, screen),
+                        DefaultColormap(dpy, screen), &xft_title);
+        }
     }
 
-    // Draw main diamond
-    XSetForeground(dpy, lock_gc, purple_color);
-    XFillPolygon(dpy, lock_win, lock_gc, diamond, 4, Convex, CoordModeOrigin);
-
-    // Draw highlight
-    XSetForeground(dpy, lock_gc, accent_light);
-    XDrawLine(dpy, lock_win, lock_gc, center_x, diamond_y,
-              diamond_x + diamond_size - 1, center_y - 60 - 1);
-
-    // Draw "DiamondWM" text
-    XSetForeground(dpy, lock_gc, text_primary);
-    XFontStruct* font = XLoadQueryFont(dpy, "fixed");
-    char *title = "DiamondWM";
-    int title_width = XTextWidth(font, title, strlen(title));
-    XDrawString(dpy, lock_win, lock_gc, center_x - title_width / 2, center_y + 60,
-                title, strlen(title));
-
-    // Draw lock message
-    XSetForeground(dpy, lock_gc, text_secondary);
+    // Draw lock message with anti-aliased font
     char *message = "Press any key to unlock";
-    int text_width = XTextWidth(font, message, strlen(message));
-    XDrawString(dpy, lock_win, lock_gc, center_x - text_width / 2, center_y + 85,
-                message, strlen(message));
+    if (xft_fonts.regular) {
+        XGlyphInfo extents;
+        XftTextExtents8(dpy, xft_fonts.regular, (XftChar8 *)message, strlen(message), &extents);
+        int msg_width = extents.width;
+        int msg_x = center_x - msg_width / 2;
+        int msg_y = center_y + 80;
+
+        XRenderColor msg_color;
+        msg_color.red = ((text_secondary >> 16) & 0xFF) * 257;
+        msg_color.green = ((text_secondary >> 8) & 0xFF) * 257;
+        msg_color.blue = (text_secondary & 0xFF) * 257;
+        msg_color.alpha = 0xFFFF;
+
+        XftColor xft_msg;
+        if (XftColorAllocValue(dpy, DefaultVisual(dpy, screen),
+                              DefaultColormap(dpy, screen),
+                              &msg_color, &xft_msg)) {
+            XftDrawStringUtf8(lock_xft_draw, &xft_msg, xft_fonts.regular,
+                             msg_x, msg_y + xft_fonts.regular->ascent, (XftChar8 *)message, strlen(message));
+            XftColorFree(dpy, DefaultVisual(dpy, screen),
+                        DefaultColormap(dpy, screen), &xft_msg);
+        }
+    }
 
     XFlush(dpy);
 
@@ -1254,6 +1302,7 @@ void lock_screen() {
     }
 
     // Cleanup
+    XftDrawDestroy(lock_xft_draw);
     XUngrabKeyboard(dpy, CurrentTime);
     XUngrabPointer(dpy, CurrentTime);
     XUnmapWindow(dpy, lock_win);
@@ -1263,6 +1312,7 @@ void lock_screen() {
     show_operation_feedback("Screen unlocked");
     debug_log("Enhanced lock screen deactivated");
 }
+
 
 void create_app_launcher() {
     load_applications();
@@ -1388,6 +1438,28 @@ void filter_applications_by_search() {
 
         // Expand category only if it has matching apps
         cat->expanded = (match_count > 0);
+    }
+}
+
+
+void draw_app_launcher_text(int x, int y, const char *text, unsigned long color, XftFont *font) {
+    if (font && xft_draw) {
+        XRenderColor render_color;
+        render_color.red = ((color >> 16) & 0xFF) * 257;
+        render_color.green = ((color >> 8) & 0xFF) * 257;
+        render_color.blue = (color & 0xFF) * 257;
+        render_color.alpha = 0xFFFF;
+
+        XftColor xft_color;
+        if (XftColorAllocValue(dpy, DefaultVisual(dpy, screen),
+                              DefaultColormap(dpy, screen),
+                              &render_color, &xft_color)) {
+            // Add font ascent to Y coordinate for proper vertical alignment
+            XftDrawStringUtf8(xft_draw, &xft_color, font, x, y + font->ascent,
+                             (XftChar8 *)text, strlen(text));
+            XftColorFree(dpy, DefaultVisual(dpy, screen),
+                        DefaultColormap(dpy, screen), &xft_color);
+        }
     }
 }
 
@@ -2087,15 +2159,15 @@ void handle_button_press(XButtonEvent *e) {
                 if (e->x >= x && e->x <= x + 40 && e->y >= 10 && e->y <= 40) {
                     debug_log("Panel button clicked for client %d", i);
 
-                    // Left click - show control menu ABOVE this specific button
-                    if (e->button == Button1) {
+                    // RIGHT click - show control menu ABOVE this specific button
+                    if (e->button == Button3) {
                         int menu_x = panel.x + x;
                         int menu_y = panel.y;
                         show_window_control_menu(menu_x, menu_y, clients[i]);
                         return;
                     }
 
-                    // Other buttons or right-click - existing behavior
+                    // LEFT click - activate and show window
                     if (!is_window_visible(clients[i])) {
                         debug_log("Window %d is not visible, repositioning to 10,10", i);
 
@@ -2950,16 +3022,17 @@ void draw_window_control_menu() {
                      window_control_menu.width - 10, y);
         }
 
+        XSetForeground(dpy, menu_gc, text_primary);
+        int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), items[i], strlen(items[i]));
+        int text_x = (window_control_menu.width - text_width) / 2;
+
         // Calculate text position for proper centering
         int text_y = y + (MENU_ITEM_HEIGHT / 2) + 5;
 
         // Draw menu item text with anti-aliased font
-        draw_xft_text(window_control_menu.win,
-                     window_control_menu.width / 2,  // Center horizontally
-                     text_y,
-                     items[i],
-                     xft_fonts.regular,
-                     text_primary);
+        XDrawString(dpy, window_control_menu.win, menu_gc, text_x, text_y,
+           items[i], strlen(items[i]));
+
     }
 }
 
