@@ -16,6 +16,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 #define PANEL_HEIGHT 50
 #define BORDER_WIDTH 1
@@ -34,6 +35,7 @@
 
 // Debug logging function
 void debug_log(const char* format, ...) {
+    return;
     FILE* log_file = fopen("/tmp/diamondwm_debug.log", "a");
     if (!log_file) return;
 
@@ -195,6 +197,17 @@ XftFontSystem xft_fonts;
 XftDraw *xft_draw = NULL;
 XftColor xft_color, xft_panel_color, xft_menu_color, xft_title_color;
 
+typedef struct {
+    Window win;
+    int visible;
+    int x, y;
+    int width, height;
+    char text[256];
+    PinnedApp *target_app;
+} Tooltip;
+
+Tooltip tooltip;
+
 // Function declarations
 void create_panel();
 void draw_panel();
@@ -268,6 +281,12 @@ void show_pinned_app_menu(int x, int y, PinnedApp *app);
 void hide_pinned_app_menu();
 void draw_pinned_app_menu();
 void free_pinned_apps();
+
+void show_tooltip(int x, int y, PinnedApp *app);
+void hide_tooltip();
+void draw_tooltip();
+
+int is_app_running(const char *app_name);
 
 // Xft font loading (for anti-aliased fonts)
 void load_xft_fonts() {
@@ -346,8 +365,70 @@ void draw_xft_text(Drawable d, int x, int y, const char *text, XftFont *font, un
     }
 }
 
+void show_tooltip(int x, int y, PinnedApp *app) {
+    if (!app || !app->name) return;
+
+    tooltip.visible = 1;
+    tooltip.target_app = app;
+    strncpy(tooltip.text, app->name, sizeof(tooltip.text) - 1);
+    tooltip.text[sizeof(tooltip.text) - 1] = '\0';
+
+    // Calculate tooltip dimensions
+    int text_len = strlen(tooltip.text);
+    tooltip.width = text_len * 7 + 20;
+    tooltip.height = 30;
+
+    // Position tooltip above the pinned app icon
+    tooltip.x = x - tooltip.width / 2;
+    tooltip.y = panel.y - tooltip.height - 5;
+
+    // Keep tooltip on screen
+    if (tooltip.x < 5) tooltip.x = 5;
+    if (tooltip.x + tooltip.width > DisplayWidth(dpy, screen) - 5) {
+        tooltip.x = DisplayWidth(dpy, screen) - tooltip.width - 5;
+    }
+
+    XMoveResizeWindow(dpy, tooltip.win, tooltip.x, tooltip.y, tooltip.width, tooltip.height);
+    XMapWindow(dpy, tooltip.win);
+    XRaiseWindow(dpy, tooltip.win);
+
+    draw_tooltip();
+}
+
+void hide_tooltip() {
+    if (tooltip.visible) {
+        tooltip.visible = 0;
+        tooltip.target_app = NULL;
+        XUnmapWindow(dpy, tooltip.win);
+    }
+}
+
+void draw_tooltip() {
+    if (!tooltip.visible) return;
+
+    XClearWindow(dpy, tooltip.win);
+
+    // Draw rounded background
+    XSetForeground(dpy, menu_gc, 0x2D2D3D);
+    draw_rounded_rectangle(tooltip.win, menu_gc, 0, 0, tooltip.width, tooltip.height, 6);
+
+    // Draw border
+    XSetForeground(dpy, menu_gc, accent_color);
+    XDrawRectangle(dpy, tooltip.win, menu_gc, 1, 1, tooltip.width - 3, tooltip.height - 3);
+
+    // Draw text
+    XSetForeground(dpy, menu_gc, text_primary);
+    int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), tooltip.text, strlen(tooltip.text));
+    int text_x = (tooltip.width - text_width) / 2;
+    int text_y = tooltip.height / 2 + 5;
+    XDrawString(dpy, tooltip.win, menu_gc, text_x, text_y, tooltip.text, strlen(tooltip.text));
+}
+
 void set_background() {
-    system("feh --bg-scale /usr/share/backgrounds/* 2>/dev/null &");
+    int result = system("feh --bg-scale /usr/share/backgrounds/* 2>/dev/null &");
+    if (result == -1) {
+        debug_log("WARNING: Failed to set background with feh");
+    }
 
     Pixmap bg_pixmap = XCreatePixmap(dpy, root,
                                     DisplayWidth(dpy, screen),
@@ -554,6 +635,7 @@ void update_button_hover(Client *c, int x, int y) {
         c->button_hover = 3;
     }
 
+    // Only redraw if hover state actually changed
     if (old_hover != c->button_hover) {
         draw_window_decorations(c);
     }
@@ -702,7 +784,8 @@ void check_clock_update() {
     static time_t last_update = 0;
     time_t now = time(NULL);
 
-    if (now != last_update) {
+    // Only update if minute has changed (not every second)
+    if (now / 60 != last_update / 60) {
         last_update = now;
         draw_panel();
     }
@@ -1832,6 +1915,10 @@ void save_pinned_apps() {
                 pinned_apps.apps[i].name ? pinned_apps.apps[i].name : "",
                 pinned_apps.apps[i].exec ? pinned_apps.apps[i].exec : "",
                 pinned_apps.apps[i].icon_path ? pinned_apps.apps[i].icon_path : "");
+
+        debug_log("Saved pinned app: %s -> %s",
+                 pinned_apps.apps[i].name ? pinned_apps.apps[i].name : "NULL",
+                 pinned_apps.apps[i].exec ? pinned_apps.apps[i].exec : "NULL");
     }
 
     fclose(file);
@@ -1849,11 +1936,21 @@ void load_pinned_apps() {
     while (fgets(line, sizeof(line), file)) {
         line[strcspn(line, "\n")] = 0;
 
+        // Skip empty lines
+        if (strlen(line) == 0) continue;
+
+        debug_log("Reading pinned app line: '%s'", line);
+
         char *name = strtok(line, "|");
         char *exec = strtok(NULL, "|");
         char *icon_path = strtok(NULL, "|");
 
-        if (name && exec) {
+        debug_log("Parsed: name='%s', exec='%s', icon_path='%s'",
+                 name ? name : "NULL",
+                 exec ? exec : "NULL",
+                 icon_path ? icon_path : "NULL");
+
+        if (name && strlen(name) > 0) {
             // Add to pinned apps
             if (pinned_apps.app_count >= pinned_apps.max_apps) {
                 pinned_apps.max_apps += 10;
@@ -1862,18 +1959,47 @@ void load_pinned_apps() {
 
             PinnedApp *app = &pinned_apps.apps[pinned_apps.app_count++];
             app->name = strdup(name);
-            app->exec = strdup(exec);
+
+            // If exec is empty, try to guess it from the name
+            if (exec && strlen(exec) > 0) {
+                app->exec = strdup(exec);
+            } else {
+                // Guess the command from the app name
+                if (strstr(name, "Firefox") || strstr(name, "Mozilla")) {
+                    app->exec = strdup("firefox");
+                } else if (strstr(name, "Pulsar")) {
+                    app->exec = strdup("pulsar");
+                } else if (strstr(name, "xterm") || strstr(name, "XTerm")) {
+                    app->exec = strdup("xterm");
+                } else if (strstr(name, "Terminal")) {
+                    app->exec = strdup("xterm");
+                } else {
+                    // Fallback: use the name in lowercase
+                    app->exec = malloc(strlen(name) + 1);
+                    if (app->exec) {
+                        strcpy(app->exec, name);
+                        // Convert to lowercase and remove spaces
+                        for (char *p = app->exec; *p; p++) {
+                            *p = tolower(*p);
+                            if (*p == ' ') *p = '-';
+                        }
+                    }
+                }
+                debug_log("Guessed exec for '%s': %s", name, app->exec);
+            }
+
             app->icon_path = icon_path ? strdup(icon_path) : NULL;
             app->icon_win = 0;
             app->x_position = 0;
 
-            debug_log("Loaded pinned app: %s -> %s", name, exec);
+            debug_log("Loaded pinned app: '%s' -> '%s'", name, app->exec);
         }
     }
 
     fclose(file);
-    debug_log("Loaded %d pinned apps", pinned_apps.app_count);
+    debug_log("Loaded %d pinned apps total", pinned_apps.app_count);
 }
+
 
 int is_app_pinned(Client *c) {
     if (!c || !c->title) return 0;
@@ -1892,6 +2018,78 @@ void pin_app_to_panel(Client *c) {
         return;
     }
 
+    // Try to get the executable command from the window
+    char *exec_cmd = NULL;
+
+    // Method 1: Try to get _NET_WM_PID and then get command from /proc
+    Atom net_wm_pid = XInternAtom(dpy, "_NET_WM_PID", False);
+    Atom type;
+    int format;
+    unsigned long nitems, bytes_after;
+    unsigned char *data = NULL;
+
+    if (XGetWindowProperty(dpy, c->win, net_wm_pid, 0, 1, False,
+                          XA_CARDINAL, &type, &format, &nitems, &bytes_after, &data) == Success) {
+        if (data && nitems > 0) {
+            pid_t pid = *(pid_t*)data;
+            debug_log("Found PID for window: %d", pid);
+
+            // Try to get command from /proc
+            char proc_path[256];
+            snprintf(proc_path, sizeof(proc_path), "/proc/%d/cmdline", pid);
+            FILE *proc_file = fopen(proc_path, "r");
+            if (proc_file) {
+                char cmdline[1024];
+                if (fgets(cmdline, sizeof(cmdline), proc_file)) {
+                    // cmdline is null-separated, get the first part (executable name)
+                    exec_cmd = strdup(cmdline);
+                    // Extract just the basename
+                    char *basename = strrchr(exec_cmd, '/');
+                    if (basename) {
+                        basename++; // Skip the '/'
+                        free(exec_cmd);
+                        exec_cmd = strdup(basename);
+                    }
+                    debug_log("Found command from PID: %s", exec_cmd);
+                }
+                fclose(proc_file);
+            }
+            XFree(data);
+        }
+    }
+
+    // Method 2: If we couldn't get from PID, try to guess from window title
+    if (!exec_cmd) {
+        // Common application mappings
+        if (strstr(c->title, "Firefox") || strstr(c->title, "Mozilla")) {
+            exec_cmd = strdup("firefox");
+        } else if (strstr(c->title, "Pulsar")) {
+            exec_cmd = strdup("pulsar");
+        } else if (strstr(c->title, "xterm") || strstr(c->title, "XTerm")) {
+            exec_cmd = strdup("xterm");
+        } else if (strstr(c->title, "Terminal")) {
+            exec_cmd = strdup("xterm");
+        } else {
+            // Fallback: use the title in lowercase as command
+            exec_cmd = malloc(strlen(c->title) + 1);
+            if (exec_cmd) {
+                strcpy(exec_cmd, c->title);
+                // Convert to lowercase and remove spaces
+                for (char *p = exec_cmd; *p; p++) {
+                    *p = tolower(*p);
+                    if (*p == ' ') *p = '-';
+                }
+            }
+        }
+        debug_log("Guessed command from title: %s", exec_cmd);
+    }
+
+    // Method 3: If all else fails, use a safe default
+    if (!exec_cmd) {
+        exec_cmd = strdup(c->title);
+        debug_log("Using title as fallback command: %s", exec_cmd);
+    }
+
     // Add to pinned apps
     if (pinned_apps.app_count >= pinned_apps.max_apps) {
         pinned_apps.max_apps += 10;
@@ -1900,7 +2098,7 @@ void pin_app_to_panel(Client *c) {
 
     PinnedApp *app = &pinned_apps.apps[pinned_apps.app_count++];
     app->name = strdup(c->title);
-    app->exec = NULL; // We don't have the original exec command for existing windows
+    app->exec = exec_cmd;
     app->icon_path = NULL;
     app->icon_win = 0;
     app->x_position = 0;
@@ -1911,13 +2109,15 @@ void pin_app_to_panel(Client *c) {
     // Redraw panel to show new pinned app
     draw_panel();
 
-    debug_log("Pinned app to panel: %s", c->title);
+    debug_log("Pinned app to panel: %s -> %s", c->title, exec_cmd);
 }
 
 void unpin_app(PinnedApp *app) {
     // Find and remove the app
     for (int i = 0; i < pinned_apps.app_count; i++) {
         if (&pinned_apps.apps[i] == app) {
+            debug_log("Unpinning app at index %d: %s", i, app->name);
+
             free(pinned_apps.apps[i].name);
             free(pinned_apps.apps[i].exec);
             free(pinned_apps.apps[i].icon_path);
@@ -1930,15 +2130,26 @@ void unpin_app(PinnedApp *app) {
 
             save_pinned_apps();
             draw_panel();
-            debug_log("Unpinned app: %s", app->name);
+            debug_log("Unpinned app: %s, new count: %d", app->name, pinned_apps.app_count);
             return;
         }
     }
+    debug_log("ERROR: App not found for unpinning: %s", app->name);
+}
+
+int is_app_running(const char *app_name) {
+    for (int i = 0; i < client_count; i++) {
+        if (clients[i] && clients[i]->title &&
+            strstr(clients[i]->title, app_name) != NULL) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void create_pinned_app_menu() {
     pinned_app_menu.width = MENU_WIDTH;
-    pinned_app_menu.height = MENU_ITEM_HEIGHT * 2;
+    pinned_app_menu.height = MENU_ITEM_HEIGHT * 5;
     pinned_app_menu.x = 0;
     pinned_app_menu.y = 0;
     pinned_app_menu.hover_item = -1;
@@ -1990,6 +2201,7 @@ void show_pinned_app_menu(int x, int y, PinnedApp *app) {
     }
 }
 
+
 void hide_pinned_app_menu() {
     if (pinned_app_menu.visible) {
         // Fade-out animation
@@ -2024,9 +2236,39 @@ void draw_pinned_app_menu() {
     XDrawRectangle(dpy, pinned_app_menu.win, menu_gc, 1, 1,
                    pinned_app_menu.width - 3, pinned_app_menu.height - 3);
 
-    char *items[] = {"Unpin from Panel", "Launch"};
+    // Check if app is already running and find its window
+    Client *target_client = NULL;
+    if (pinned_app_menu.target_pinned_app && pinned_app_menu.target_pinned_app->name) {
+        for (int i = 0; i < client_count; i++) {
+            if (clients[i] && clients[i]->title &&
+                strcmp(clients[i]->title, pinned_app_menu.target_pinned_app->name) == 0) {
+                target_client = clients[i];
+                break;
+            }
+        }
+    }
 
-    for (int i = 0; i < 2; i++) {
+    int is_running = (target_client != NULL);
+    char *items[5];
+
+    if (is_running) {
+        items[0] = "Show Windows";
+        items[1] = "Maximize";
+        items[2] = "Minimize";
+        items[3] = "Close";
+        items[4] = "Unpin from Panel";
+    } else {
+        items[0] = "Launch";
+        items[1] = ""; // Empty for non-running apps
+        items[2] = ""; // Empty for non-running apps
+        items[3] = ""; // Empty for non-running apps
+        items[4] = "Unpin from Panel";
+    }
+
+    for (int i = 0; i < 5; i++) {
+        // Skip empty menu items for non-running apps
+        if (!is_running && (i == 1 || i == 2 || i == 3)) continue;
+
         int y = i * MENU_ITEM_HEIGHT;
 
         // Hover effect
@@ -2036,7 +2278,7 @@ void draw_pinned_app_menu() {
                                   pinned_app_menu.width - 4, MENU_ITEM_HEIGHT - 4, 4);
         }
 
-        if (i > 0) {
+        if (i > 0 && strlen(items[i]) > 0 && strlen(items[i-1]) > 0) {
             XSetForeground(dpy, menu_gc, 0x404040);
             XDrawLine(dpy, pinned_app_menu.win, menu_gc, 10, y,
                      pinned_app_menu.width - 10, y);
@@ -2110,19 +2352,39 @@ void draw_panel() {
 
     int x = 10;
 
-    // Draw pinned apps first
+    // Draw pinned apps first - FIXED VERSION
+    debug_log("Drawing %d pinned apps", pinned_apps.app_count);
     for (int i = 0; i < pinned_apps.app_count; i++) {
+        if (!pinned_apps.apps[i].name) continue;
+
         pinned_apps.apps[i].x_position = x;
 
-        // Draw pinned app icon (simplified version - you can enhance with actual icons)
-        XSetForeground(dpy, panel_gc, accent_color);
+        // Check if app is running
+        int is_running = is_app_running(pinned_apps.apps[i].name);
+
+        // Draw pinned app icon with different color for running apps
+        if (is_running) {
+            XSetForeground(dpy, panel_gc, button_green); // Green for running
+        } else {
+            XSetForeground(dpy, panel_gc, accent_color); // Normal color for not running
+        }
         draw_rounded_rectangle(panel.win, panel_gc, x, 10, 30, 30, 6);
+
+        // Draw border
+        XSetForeground(dpy, panel_gc, is_running ? 0x88FF88 : accent_light);
+        XDrawRectangle(dpy, panel.win, panel_gc, x, 10, 30, 30);
 
         // Draw app initial or simple representation
         XSetForeground(dpy, panel_gc, text_primary);
         if (pinned_apps.apps[i].name && strlen(pinned_apps.apps[i].name) > 0) {
             char initial[2] = {toupper(pinned_apps.apps[i].name[0]), '\0'};
-            XDrawString(dpy, panel.win, panel_gc, x + 11, 28, initial, 1);
+            int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), initial, 1);
+            int text_x = x + (30 - text_width) / 2;
+            int text_y = 28; // Centered vertically
+            XDrawString(dpy, panel.win, panel_gc, text_x, text_y, initial, 1);
+
+            debug_log("Drawing pinned app '%s' at position %d (running: %d)",
+                     pinned_apps.apps[i].name, x, is_running);
         }
 
         x += 40;
@@ -2340,361 +2602,486 @@ void send_wm_delete(Window w) {
 }
 
 void handle_button_press(XButtonEvent *e) {
-  debug_log("Button press on window %lu (button=%d) at screen coords %d,%d",
-           e->window, e->button, e->x_root, e->y_root);
+    debug_log("Button press on window %lu (button=%d) at screen coords %d,%d",
+             e->window, e->button, e->x_root, e->y_root);
 
-  // Handle right-click on desktop (already handled in main loop, but keep for completeness)
-  if (e->window == root && e->button == Button3) {
-      debug_log("Right click on desktop - showing app launcher");
-      show_app_launcher(e->x_root, e->y_root);
-      return;
-  }
+    // Handle app launcher visibility FIRST
+    if (app_launcher.visible) {
+        debug_log("App launcher visible, checking if click is inside...");
+        if (is_in_app_launcher_area(e->x_root, e->y_root)) {
+            debug_log("Click INSIDE app launcher at %d,%d", e->x_root, e->y_root);
+            handle_app_launcher_click(e->x_root, e->y_root);
+            return;
+        } else {
+            debug_log("Click OUTSIDE app launcher at %d,%d", e->x_root, e->y_root);
+            hide_app_launcher();
+        }
+    }
 
-  // ===== Check for app launcher visibility FIRST =====
-  if (app_launcher.visible) {
-      debug_log("App launcher visible, checking if click is inside...");
-      if (is_in_app_launcher_area(e->x_root, e->y_root)) {
-          debug_log("Click INSIDE app launcher at %d,%d", e->x_root, e->y_root);
-          // Click on app launcher itself - handle normally
-          handle_app_launcher_click(e->x_root, e->y_root);
-          return;
-      } else {
-          debug_log("Click OUTSIDE app launcher at %d,%d", e->x_root, e->y_root);
-          // Click outside app launcher - close it
-          hide_app_launcher();
-          // Don't return here - let the click be processed by other handlers
-      }
-  }
+    // ===== Check for pinned app menu =====
+    if (pinned_app_menu.visible) {
+        if (e->x_root >= pinned_app_menu.x &&
+            e->x_root <= pinned_app_menu.x + pinned_app_menu.width &&
+            e->y_root >= pinned_app_menu.y &&
+            e->y_root <= pinned_app_menu.y + pinned_app_menu.height) {
 
-  // ===== Check for pinned app menu =====
-  if (pinned_app_menu.visible) {
-      if (e->x_root >= pinned_app_menu.x &&
-          e->x_root <= pinned_app_menu.x + pinned_app_menu.width &&
-          e->y_root >= pinned_app_menu.y &&
-          e->y_root <= pinned_app_menu.y + pinned_app_menu.height) {
+            int relative_y = e->y_root - pinned_app_menu.y;
+            int item = relative_y / MENU_ITEM_HEIGHT;
 
-          int relative_y = e->y_root - pinned_app_menu.y;
-          int item = relative_y / MENU_ITEM_HEIGHT;
+            debug_log("Pinned app menu clicked: item=%d", item);
 
-          debug_log("Pinned app menu clicked: item=%d", item);
+            if (item >= 0 && item < 5 && pinned_app_menu.target_pinned_app) {
+                PinnedApp *app = pinned_app_menu.target_pinned_app;
 
-          if (item >= 0 && item < 2 && pinned_app_menu.target_pinned_app) {
-              PinnedApp *app = pinned_app_menu.target_pinned_app;
-              switch (item) {
-                  case 0: // Unpin from Panel
-                      debug_log("Unpin clicked");
-                      hide_pinned_app_menu();
-                      unpin_app(app);
-                      show_operation_feedback("App unpinned from panel");
-                      return;
-                  case 1: // Launch
-                      debug_log("Launch clicked");
-                      hide_pinned_app_menu();
-                      if (app->exec) {
-                          pid_t pid = fork();
-                          if (pid == 0) {
-                              setsid();
-                              execl("/bin/sh", "sh", "-c", app->exec, NULL);
-                              exit(0);
-                          }
-                          show_operation_feedback("App launched");
-                      }
-                      return;
-              }
-          }
-          hide_pinned_app_menu();
-          return;
-      } else {
-          hide_pinned_app_menu();
-      }
-  }
+                // Find the client window for this app
+                Client *target_client = NULL;
+                for (int i = 0; i < client_count; i++) {
+                    if (clients[i] && clients[i]->title &&
+                        strcmp(clients[i]->title, app->name) == 0) {
+                        target_client = clients[i];
+                        break;
+                    }
+                }
 
-  // ===== Check for window control menu =====
-  if (window_control_menu.visible) {
-      if (e->x_root >= window_control_menu.x &&
-          e->x_root <= window_control_menu.x + window_control_menu.width &&
-          e->y_root >= window_control_menu.y &&
-          e->y_root <= window_control_menu.y + window_control_menu.height) {
+                int is_running = (target_client != NULL);
 
-          int relative_y = e->y_root - window_control_menu.y;
-          int item = relative_y / MENU_ITEM_HEIGHT;
+                // Adjust item index for non-running apps (skip empty slots)
+                int actual_item = item;
+                if (!is_running) {
+                    if (item >= 1 && item <= 3) {
+                        // Skip empty slots for non-running apps
+                        hide_pinned_app_menu();
+                        return;
+                    } else if (item == 4) {
+                        actual_item = 1; // Unpin is the only option after Launch
+                    }
+                }
 
-          debug_log("Window control menu clicked: item=%d", item);
+                switch (actual_item) {
+                    case 0: // Launch/Show Windows
+                        if (is_running) {
+                            // Show all windows of this app
+                            if (target_client->is_mapped) {
+                                XRaiseWindow(dpy, target_client->frame);
+                                XSetInputFocus(dpy, target_client->win, RevertToPointerRoot, CurrentTime);
+                                target_client->is_active = 1;
+                                draw_window_decorations(target_client);
+                            } else {
+                                // Window was minimized, show it
+                                XMapWindow(dpy, target_client->frame);
+                                XMapWindow(dpy, target_client->win);
+                                target_client->is_mapped = 1;
+                                XRaiseWindow(dpy, target_client->frame);
+                                XSetInputFocus(dpy, target_client->win, RevertToPointerRoot, CurrentTime);
+                            }
+                            show_operation_feedback("App windows shown");
+                        } else {
+                            // Launch the app
+                            if (app->exec && strlen(app->exec) > 0) {
+                                debug_log("Launching pinned app: %s", app->exec);
+                                pid_t pid = fork();
+                                if (pid == 0) {
+                                    setsid();
+                                    execl("/bin/sh", "sh", "-c", app->exec, NULL);
+                                    exit(0);
+                                } else if (pid > 0) {
+                                    show_operation_feedback("App launched");
+                                } else {
+                                    debug_log("ERROR: Failed to fork for pinned app launch");
+                                    show_operation_feedback("Failed to launch app");
+                                }
+                            }
+                        }
+                        break;
 
-          if (item >= 0 && item < 4 && window_control_menu.target_client) {
-              Client *c = window_control_menu.target_client;
-              switch (item) {
-                  case 0: // Pin to Panel
-                      debug_log("Pin to Panel clicked");
-                      hide_window_control_menu();
-                      pin_app_to_panel(c);
-                      show_operation_feedback("App pinned to panel");
-                      return;
-                  case 1: // Maximize
-                      debug_log("Maximize clicked");
-                      hide_window_control_menu();
-                      toggle_fullscreen(c);
-                      show_operation_feedback(c->is_fullscreen ? "Window maximized" : "Window restored");
-                      return;
-                  case 2: // Minimize
-                      debug_log("Minimize clicked");
-                      hide_window_control_menu();
-                      lower_window(c);
-                      show_operation_feedback("Window minimized");
-                      return;
-                  case 3: // Close
-                      debug_log("Close clicked");
-                      hide_window_control_menu();
-                      close_window(c);
-                      show_operation_feedback("Window closed");
-                      return;
-              }
-          }
-          hide_window_control_menu();
-          return;
-      } else {
-          hide_window_control_menu();
-      }
-  }
+                    case 1: // Maximize (only for running apps)
+                        if (is_running && target_client) {
+                            debug_log("Maximizing window from pinned app menu");
+                            show_operation_feedback(target_client->is_fullscreen ? "Window restored" : "Window maximized");
+                            toggle_fullscreen(target_client);
+                        }
+                        break;
 
-  // ===== Then check for menu visibility =====
-  if (menu.visible) {
-      // Check if click is inside menu area using root coordinates
-      if (e->x_root >= menu.x && e->x_root <= menu.x + menu.width &&
-          e->y_root >= menu.y && e->y_root <= menu.y + menu.height) {
+                    case 2: // Minimize (only for running apps)
+                        if (is_running && target_client) {
+                            debug_log("Minimizing window from pinned app menu");
+                            show_operation_feedback("Window minimized");
+                            lower_window(target_client);
+                        }
+                        break;
 
-          // Calculate which menu item was clicked
-          int relative_y = e->y_root - menu.y;
-          int item = relative_y / MENU_ITEM_HEIGHT;
+                    case 3: // Close (only for running apps)
+                        if (is_running && target_client) {
+                            debug_log("Closing window from pinned app menu");
+                            show_operation_feedback("Window closed");
+                            close_window(target_client);
+                        }
+                        break;
 
-          debug_log("Menu clicked: relative_y=%d, item=%d", relative_y, item);
+                    case 4: // Unpin from Panel
+                        debug_log("Unpinning app: %s", app->name);
+                        unpin_app(app);
+                        show_operation_feedback("App unpinned");
+                        break;
+                }
+            }
+            hide_pinned_app_menu();
+            return;
+        } else {
+            // Click outside menu - hide it
+            hide_pinned_app_menu();
+        }
+    }
 
-          // Check if item is valid (0-3)
-          if (item >= 0 && item < 4) {
-              switch (item) {
-                  case 0: // Terminal
-                      debug_log("Terminal clicked - launching xterm");
-                      hide_menu();
-                      system("xterm &");
-                      show_operation_feedback("Terminal launched");
-                      return;
-                  case 1: // Lock
-                      debug_log("Lock clicked - locking screen");
-                      hide_menu();
-                      lock_screen();
-                      return;
-                  case 2: // Logout
-                      debug_log("Logout clicked - exiting window manager");
-                      hide_menu();
-                      show_operation_feedback("Logging out...");
-                      for (int i = 0; i < client_count; i++) {
-                          if (clients[i]) {
-                              XUnmapWindow(dpy, clients[i]->frame);
-                              XReparentWindow(dpy, clients[i]->win, root, 0, 0);
-                              XMapWindow(dpy, clients[i]->win);
-                          }
-                      }
-                      XCloseDisplay(dpy);
-                      exit(0);
-                      return;
-                  case 3: // Shutdown
-                      debug_log("Shutdown clicked - calling system shutdown");
-                      hide_menu();
-                      show_operation_feedback("Shutting down...");
-                      system("shutdown -h now");
-                      return;
-              }
-          } else {
-              debug_log("Invalid menu item: %d", item);
-              hide_menu();
-              return;
-          }
-      } else {
-          // Click outside menu - hide it
-          debug_log("Click outside menu area - hiding it");
-          hide_menu();
-          // Don't return - let the click be processed
-      }
-  }
+    // ===== Check if click is on a WINDOW FRAME first =====
+    for (int i = 0; i < client_count; i++) {
+        if (clients[i] && clients[i]->frame == e->window) {
+            Client *c = clients[i];
+            debug_log("Click on frame %lu at %d,%d", c->frame, e->x, e->y);
 
-  // Check if click is on panel
-  if (e->window == panel.win) {
-      debug_log("Click on panel at %d,%d", e->x, e->y);
+            // Check for resize edges first
+            int edge = get_resize_edge(c, e->x, e->y);
+            if (edge != -1 && e->button == Button1) {
+                debug_log("Resize edge %d clicked", edge);
+                window_resizing = 1;
+                resized_client = c;
+                resize_start_x = e->x_root;
+                resize_start_y = e->y_root;
+                resize_start_width = c->width;
+                resize_start_height = c->height;
+                resize_edge = edge;
 
-      // Check pinned apps first
-      for (int i = 0; i < pinned_apps.app_count; i++) {
-          if (e->x >= pinned_apps.apps[i].x_position &&
-              e->x <= pinned_apps.apps[i].x_position + 30 &&
-              e->y >= 10 && e->y <= 40) {
+                Cursor resize_cursor;
+                switch (edge) {
+                    case 0: case 1: resize_cursor = XCreateFontCursor(dpy, XC_sb_h_double_arrow); break;
+                    case 2: case 3: resize_cursor = XCreateFontCursor(dpy, XC_sb_v_double_arrow); break;
+                    case 4: case 7: resize_cursor = XCreateFontCursor(dpy, XC_top_left_corner); break;
+                    case 5: case 6: resize_cursor = XCreateFontCursor(dpy, XC_top_right_corner); break;
+                    default: resize_cursor = XCreateFontCursor(dpy, XC_left_ptr);
+                }
+                XDefineCursor(dpy, c->frame, resize_cursor);
+                return;
+            }
 
-              debug_log("Pinned app clicked: %s", pinned_apps.apps[i].name);
+            // Check for titlebar buttons
+            if (is_in_titlebar(c, e->x, e->y)) {
+                // Handle close button
+                if (is_in_close_button(c, e->x, e->y)) {
+                    if (e->button == Button1) {
+                        debug_log("Close button clicked for window: %s", c->title);
+                        show_operation_feedback("Closing window...");
+                        close_window(c);
+                        return;
+                    }
+                    return;
+                }
 
-              if (e->button == Button3) {
-                  // Right click - show unpin menu
-                  show_pinned_app_menu(panel.x + pinned_apps.apps[i].x_position,
-                                      panel.y + 10, &pinned_apps.apps[i]);
-                  return;
-              } else {
-                  // Left click - launch app if we have exec command
-                  if (pinned_apps.apps[i].exec) {
-                      pid_t pid = fork();
-                      if (pid == 0) {
-                          setsid();
-                          execl("/bin/sh", "sh", "-c", pinned_apps.apps[i].exec, NULL);
-                          exit(0);
-                      }
-                      show_operation_feedback("App launched");
-                  }
-              }
-              return;
-          }
-      }
+                // Handle minimize button
+                if (is_in_minimize_button(c, e->x, e->y)) {
+                    if (e->button == Button1) {
+                        debug_log("Minimize button clicked for window: %s", c->title);
+                        show_operation_feedback("Window minimized");
+                        lower_window(c);
+                        return;
+                    }
+                    return;
+                }
 
-      // Check if click is on DiamondWM area
-      if (is_in_diamondwm_area(e->x, e->y)) {
-          debug_log("DiamondWM area clicked - toggling menu (currently visible=%d)", menu.visible);
-          if (menu.visible) {
-              hide_menu();
-          } else {
-              show_menu();
-          }
-          return;
-      }
+                // Handle maximize button
+                if (is_in_maximize_button(c, e->x, e->y)) {
+                    if (e->button == Button1) {
+                        debug_log("Maximize button clicked for window: %s", c->title);
+                        show_operation_feedback(c->is_fullscreen ? "Window restored" : "Window maximized");
+                        toggle_fullscreen(c);
+                        return;
+                    }
+                    return;
+                }
 
-      // Check window buttons
-      int x = 10 + pinned_apps.app_count * 40;
-      if (pinned_apps.app_count > 0) x += 10; // Add separator space
+                // If we get here, it's a click on the titlebar but not on any button
+                if (e->button == Button1) {
+                    debug_log("Titlebar clicked (not on buttons) - starting window drag");
+                    XRaiseWindow(dpy, c->frame);
+                    XSetInputFocus(dpy, c->win, RevertToPointerRoot, CurrentTime);
+                    c->is_active = 1;
+                    draw_window_decorations(c);
 
-      int window_index = 1;
-      for (int i = 0; i < client_count; i++) {
-          if (clients[i] && clients[i]->is_mapped && !is_app_pinned(clients[i])) {
-              if (e->x >= x && e->x <= x + 40 && e->y >= 10 && e->y <= 40) {
-                  debug_log("Panel button clicked for client %d", i);
+                    window_dragging = 1;
+                    dragged_client = c;
+                    drag_win_start_x = c->x;
+                    drag_win_start_y = c->y;
+                    drag_offset_x = e->x_root - c->x;
+                    drag_offset_y = e->y_root - c->y;
 
-                  // RIGHT click - show control menu ABOVE this specific button
-                  if (e->button == Button3) {
-                      int menu_x = panel.x + x;
-                      int menu_y = panel.y;
-                      show_window_control_menu(menu_x, menu_y, clients[i]);
-                      return;
-                  }
+                    debug_log("Window drag started: client=%lu, start_pos=%d,%d, offset=%d,%d",
+                             c->win, drag_win_start_x, drag_win_start_y, drag_offset_x, drag_offset_y);
 
-                  // LEFT click - activate and show window
-                  if (!is_window_visible(clients[i])) {
-                      debug_log("Window %d is not visible, repositioning to 10,10", i);
+                    Cursor move_cursor = XCreateFontCursor(dpy, XC_fleur);
+                    XDefineCursor(dpy, c->frame, move_cursor);
+                    return;
+                }
+            }
+            break;
+        }
+    }
 
-                      int screen_width = DisplayWidth(dpy, screen);
-                      int screen_height = DisplayHeight(dpy, screen);
+    // ===== THEN check if click is on panel =====
+    if (e->window == panel.win) {
+        debug_log("Click on panel at %d,%d", e->x, e->y);
 
-                      int max_width = screen_width - 20;
-                      int max_height = screen_height - PANEL_HEIGHT - 20;
+        // FIRST: Check if click is on DiamondWM area (this should be checked before pinned apps)
+        if (is_in_diamondwm_area(e->x, e->y)) {
+            debug_log("DiamondWM area clicked - toggling menu (currently visible=%d)", menu.visible);
+            if (menu.visible) {
+                hide_menu();
+            } else {
+                show_menu();
+            }
+            return; // Return immediately after handling DiamondWM area click
+        }
 
-                      if (clients[i]->width > max_width || clients[i]->height > max_height) {
-                          int new_width = (clients[i]->width > max_width) ? max_width : clients[i]->width;
-                          int new_height = (clients[i]->height > max_height) ? max_height : clients[i]->height;
+        // SECOND: Check pinned apps on panel
+        for (int i = 0; i < pinned_apps.app_count; i++) {
+            if (e->x >= pinned_apps.apps[i].x_position &&
+                e->x <= pinned_apps.apps[i].x_position + 30 &&
+                e->y >= 10 && e->y <= 40) {
 
-                          debug_log("Resizing window from %dx%d to %dx%d",
-                                   clients[i]->width, clients[i]->height, new_width, new_height);
+                debug_log("Pinned app clicked: %s", pinned_apps.apps[i].name);
+                hide_tooltip(); // Hide tooltip on click
 
-                          resize_window(clients[i], new_width, new_height);
-                      }
+                if (e->button == Button3) {
+                    // Right click - show menu
+                    show_pinned_app_menu(panel.x + pinned_apps.apps[i].x_position,
+                                        panel.y + 10, &pinned_apps.apps[i]);
+                    return;
+                } else if (e->button == Button1) {
+                    // Left click - check if app is running
+                    int is_running = 0;
+                    PinnedApp *app = &pinned_apps.apps[i];
 
-                      move_window(clients[i], 10, 10);
-                      debug_log("Window repositioned to 10,10 with size %dx%d",
-                               clients[i]->width, clients[i]->height);
-                  }
+                    for (int j = 0; j < client_count; j++) {
+                        if (clients[j] && clients[j]->title &&
+                            strcmp(clients[j]->title, app->name) == 0) {
+                            is_running = 1;
+                            // Show all windows of this app
+                            if (clients[j]->is_mapped) {
+                                XRaiseWindow(dpy, clients[j]->frame);
+                                XSetInputFocus(dpy, clients[j]->win, RevertToPointerRoot, CurrentTime);
+                                clients[j]->is_active = 1;
+                                draw_window_decorations(clients[j]);
+                            } else {
+                                // Window was minimized, show it
+                                XMapWindow(dpy, clients[j]->frame);
+                                XMapWindow(dpy, clients[j]->win);
+                                clients[j]->is_mapped = 1;
+                                XRaiseWindow(dpy, clients[j]->frame);
+                                XSetInputFocus(dpy, clients[j]->win, RevertToPointerRoot, CurrentTime);
+                            }
+                            show_operation_feedback("App windows shown");
+                            break;
+                        }
+                    }
 
-                  XRaiseWindow(dpy, clients[i]->frame);
-                  XSetInputFocus(dpy, clients[i]->win, RevertToPointerRoot, CurrentTime);
-                  clients[i]->is_active = 1;
-                  draw_window_decorations(clients[i]);
-                  show_operation_feedback("Window activated");
-                  break;
-              }
-              x += 50;
-              window_index++;
-          }
-      }
+                    // If not running, launch it
+                    if (!is_running && app->exec && strlen(app->exec) > 0) {
+                        debug_log("Launching pinned app: %s", app->exec);
+                        pid_t pid = fork();
+                        if (pid == 0) {
+                            setsid();
+                            execl("/bin/sh", "sh", "-c", app->exec, NULL);
+                            exit(0);
+                        } else if (pid > 0) {
+                            show_operation_feedback("App launched");
+                        } else {
+                            debug_log("ERROR: Failed to fork for pinned app launch");
+                            show_operation_feedback("Failed to launch app");
+                        }
+                    }
+                }
+                return;
+            }
+        }
 
-      // Start panel drag if clicked on empty area
-      if (e->button == Button1 && !menu.visible && !app_launcher.visible && !window_control_menu.visible && !pinned_app_menu.visible) {
-          panel_dragging = 1;
-          drag_start_x = e->x_root;
-          drag_start_y = e->y_root;
-          debug_log("Panel dragging started at %d,%d", drag_start_x, drag_start_y);
-      }
-      return;
-  }
+        // THIRD: Check for window control menu (non-pinned apps)
+        // Check window buttons for non-pinned apps
+        int x = 10 + pinned_apps.app_count * 40;
+        if (pinned_apps.app_count > 0) x += 10; // Add separator space
 
-  // Rest of the function for frame windows...
-  for (int i = 0; i < client_count; i++) {
-      if (clients[i] && clients[i]->frame == e->window) {
-          Client *c = clients[i];
-          debug_log("Click on frame %lu at %d,%d", c->frame, e->x, e->y);
+        int window_index = 1;
+        for (int i = 0; i < client_count; i++) {
+            if (clients[i] && clients[i]->is_mapped && !is_app_pinned(clients[i])) {
+                if (e->x >= x && e->x <= x + 40 && e->y >= 10 && e->y <= 40) {
+                    debug_log("Panel button clicked for client %d", i);
 
-          int edge = get_resize_edge(c, e->x, e->y);
-          if (edge != -1 && e->button == Button1) {
-              debug_log("Resize edge %d clicked", edge);
-              window_resizing = 1;
-              resized_client = c;
-              resize_start_x = e->x_root;
-              resize_start_y = e->y_root;
-              resize_start_width = c->width;
-              resize_start_height = c->height;
-              resize_edge = edge;
+                    // RIGHT click - show control menu ABOVE this specific button
+                    if (e->button == Button3) {
+                        int menu_x = panel.x + x;
+                        int menu_y = panel.y;
+                        show_window_control_menu(menu_x, menu_y, clients[i]);
+                        return;
+                    }
 
-              Cursor resize_cursor;
-              switch (edge) {
-                  case 0: case 1: resize_cursor = XCreateFontCursor(dpy, XC_sb_h_double_arrow); break;
-                  case 2: case 3: resize_cursor = XCreateFontCursor(dpy, XC_sb_v_double_arrow); break;
-                  case 4: case 7: resize_cursor = XCreateFontCursor(dpy, XC_top_left_corner); break;
-                  case 5: case 6: resize_cursor = XCreateFontCursor(dpy, XC_top_right_corner); break;
-                  default: resize_cursor = XCreateFontCursor(dpy, XC_left_ptr);
-              }
-              XDefineCursor(dpy, c->frame, resize_cursor);
-              return;
-          }
+                    // LEFT click - activate and show window
+                    if (!is_window_visible(clients[i])) {
+                        debug_log("Window %d is not visible, repositioning to 10,10", i);
 
-          if (is_in_titlebar(c, e->x, e->y)) {
-              if (is_in_close_button(c, e->x, e->y)) {
-                  debug_log("Close button clicked");
-                  show_operation_feedback("Closing window...");
-                  close_window(c);
-                  return;
-              } else if (is_in_minimize_button(c, e->x, e->y)) {
-                  debug_log("Minimize button clicked");
-                  show_operation_feedback("Window minimized");
-                  lower_window(c);
-                  return;
-              } else if (is_in_maximize_button(c, e->x, e->y)) {
-                  debug_log("Maximize button clicked");
-                  show_operation_feedback(c->is_fullscreen ? "Window restored" : "Window maximized");
-                  toggle_fullscreen(c);
-                  return;
-              } else {
-                  debug_log("Titlebar clicked - starting window drag");
-                  XRaiseWindow(dpy, c->frame);
-                  XSetInputFocus(dpy, c->win, RevertToPointerRoot, CurrentTime);
-                  c->is_active = 1;
-                  draw_window_decorations(c);
+                        int screen_width = DisplayWidth(dpy, screen);
+                        int screen_height = DisplayHeight(dpy, screen);
 
-                  window_dragging = 1;
-                  dragged_client = c;
-                  drag_win_start_x = c->x;
-                  drag_win_start_y = c->y;
-                  drag_offset_x = e->x_root - c->x;
-                  drag_offset_y = e->y_root - c->y;
+                        int max_width = screen_width - 20;
+                        int max_height = screen_height - PANEL_HEIGHT - 20;
 
-                  debug_log("Window drag started: client=%lu, start_pos=%d,%d, offset=%d,%d",
-                           c->win, drag_win_start_x, drag_win_start_y, drag_offset_x, drag_offset_y);
+                        if (clients[i]->width > max_width || clients[i]->height > max_height) {
+                            int new_width = (clients[i]->width > max_width) ? max_width : clients[i]->width;
+                            int new_height = (clients[i]->height > max_height) ? max_height : clients[i]->height;
 
-                  Cursor move_cursor = XCreateFontCursor(dpy, XC_fleur);
-                  XDefineCursor(dpy, c->frame, move_cursor);
-              }
-          }
-          break;
-      }
-  }
+                            debug_log("Resizing window from %dx%d to %dx%d",
+                                     clients[i]->width, clients[i]->height, new_width, new_height);
+
+                            resize_window(clients[i], new_width, new_height);
+                        }
+
+                        move_window(clients[i], 10, 10);
+                        debug_log("Window repositioned to 10,10 with size %dx%d",
+                                 clients[i]->width, clients[i]->height);
+                    }
+
+                    XRaiseWindow(dpy, clients[i]->frame);
+                    XSetInputFocus(dpy, clients[i]->win, RevertToPointerRoot, CurrentTime);
+                    clients[i]->is_active = 1;
+                    draw_window_decorations(clients[i]);
+                    show_operation_feedback("Window activated");
+                    break;
+                }
+                x += 50;
+                window_index++;
+            }
+        }
+
+        // Start panel drag if clicked on empty area
+        if (e->button == Button1 && !menu.visible && !app_launcher.visible && !window_control_menu.visible && !pinned_app_menu.visible) {
+            panel_dragging = 1;
+            drag_start_x = e->x_root;
+            drag_start_y = e->y_root;
+            debug_log("Panel dragging started at %d,%d", drag_start_x, drag_start_y);
+        }
+        return;
+    }
+
+    // ===== Check for window control menu =====
+    if (window_control_menu.visible) {
+        if (e->x_root >= window_control_menu.x &&
+            e->x_root <= window_control_menu.x + window_control_menu.width &&
+            e->y_root >= window_control_menu.y &&
+            e->y_root <= window_control_menu.y + window_control_menu.height) {
+
+            int relative_y = e->y_root - window_control_menu.y;
+            int item = relative_y / MENU_ITEM_HEIGHT;
+
+            debug_log("Window control menu clicked: item=%d", item);
+
+            if (item >= 0 && item < 4 && window_control_menu.target_client) {
+                Client *c = window_control_menu.target_client;
+                switch (item) {
+                    case 0: // Pin to Panel
+                        debug_log("Pin to Panel clicked");
+                        hide_window_control_menu();
+                        pin_app_to_panel(c);
+                        show_operation_feedback("App pinned to panel");
+                        return;
+                    case 1: // Maximize
+                        debug_log("Maximize clicked");
+                        hide_window_control_menu();
+                        toggle_fullscreen(c);
+                        show_operation_feedback(c->is_fullscreen ? "Window maximized" : "Window restored");
+                        return;
+                    case 2: // Minimize
+                        debug_log("Minimize clicked");
+                        hide_window_control_menu();
+                        lower_window(c);
+                        show_operation_feedback("Window minimized");
+                        return;
+                    case 3: // Close
+                        debug_log("Close clicked");
+                        hide_window_control_menu();
+                        close_window(c);
+                        show_operation_feedback("Window closed");
+                        return;
+                }
+            }
+            hide_window_control_menu();
+            return;
+        } else {
+            hide_window_control_menu();
+        }
+    }
+
+    // ===== Check for system menu =====
+    if (menu.visible) {
+        // Check if click is inside menu area using root coordinates
+        if (e->x_root >= menu.x && e->x_root <= menu.x + menu.width &&
+            e->y_root >= menu.y && e->y_root <= menu.y + menu.height) {
+
+            // Calculate which menu item was clicked
+            int relative_y = e->y_root - menu.y;
+            int item = relative_y / MENU_ITEM_HEIGHT;
+
+            debug_log("System menu clicked: relative_y=%d, item=%d", relative_y, item);
+
+            // Check if item is valid (0-3)
+            if (item >= 0 && item < 4) {
+                switch (item) {
+                    case 0: // Terminal
+                        debug_log("Terminal clicked - launching xterm");
+                        hide_menu();
+                        system("xterm &");
+                        show_operation_feedback("Terminal launched");
+                        return;
+                    case 1: // Lock
+                        debug_log("Lock clicked - locking screen");
+                        hide_menu();
+                        lock_screen();
+                        return;
+                    case 2: // Logout
+                        debug_log("Logout clicked - exiting window manager");
+                        hide_menu();
+                        show_operation_feedback("Logging out...");
+                        for (int i = 0; i < client_count; i++) {
+                            if (clients[i]) {
+                                XUnmapWindow(dpy, clients[i]->frame);
+                                XReparentWindow(dpy, clients[i]->win, root, 0, 0);
+                                XMapWindow(dpy, clients[i]->win);
+                            }
+                        }
+                        XCloseDisplay(dpy);
+                        exit(0);
+                        return;
+                    case 3: // Shutdown
+                        debug_log("Shutdown clicked - calling system shutdown");
+                        hide_menu();
+                        show_operation_feedback("Shutting down...");
+                        system("shutdown -h now");
+                        return;
+                }
+            } else {
+                debug_log("Invalid menu item: %d", item);
+                hide_menu();
+                return;
+            }
+        } else {
+            // Click outside menu - hide it
+            debug_log("Click outside system menu area - hiding it");
+            hide_menu();
+            // Don't return - let the click be processed
+        }
+    }
+
+    // ===== Check for right-click on desktop =====
+    if (e->window == root && e->button == Button3) {
+        debug_log("Right click on desktop - showing app launcher");
+        show_app_launcher(e->x_root, e->y_root);
+        return;
+    }
 }
 
 void handle_button_release(XButtonEvent *e) {
@@ -2744,258 +3131,311 @@ void handle_button_release(XButtonEvent *e) {
 }
 
 void handle_motion_notify(XMotionEvent *e) {
-  static int last_x = 0, last_y = 0;
-  static int panel_hover_index = -1;
+    static int last_x = 0, last_y = 0;
+    static int panel_hover_index = -1;
+    static int last_hover_check_time = 0;
 
-  // Handle panel hover effects
-  if (e->window == panel.win) {
-      int new_hover_index = -1;
-      int x = 10;
+    // Throttle hover checks to reduce redrawing
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    int current_time = now.tv_sec * 1000 + now.tv_usec / 1000;
+    int time_since_last_check = current_time - last_hover_check_time;
 
-      // Check pinned apps hover
-      for (int i = 0; i < pinned_apps.app_count; i++) {
-          if (e->x >= pinned_apps.apps[i].x_position &&
-              e->x <= pinned_apps.apps[i].x_position + 30 &&
-              e->y >= 10 && e->y <= 40) {
-              new_hover_index = i + 1000; // Use high number to distinguish from window indices
-              break;
-          }
-          x += 40;
-      }
+    // Handle panel hover effects (throttled)
+    if (e->window == panel.win && time_since_last_check > 50) { // Only check every 50ms
+        last_hover_check_time = current_time;
 
-      // Check window buttons hover if no pinned app hovered
-      if (new_hover_index == -1) {
-          x = 10 + pinned_apps.app_count * 40;
-          if (pinned_apps.app_count > 0) x += 10;
+        int new_hover_index = -1;
+        int x = 10;
+        int hovering_pinned_app = -1;
 
-          int window_index = 0;
-          for (int i = 0; i < client_count; i++) {
-              if (clients[i] && clients[i]->is_mapped && !is_app_pinned(clients[i])) {
-                  if (e->x >= x && e->x <= x + 40 && e->y >= 10 && e->y <= 40) {
-                      new_hover_index = i;
-                      break;
-                  }
-                  x += 50;
-                  window_index++;
-              }
-          }
-      }
+        // Check pinned apps hover
+        for (int i = 0; i < pinned_apps.app_count; i++) {
+            if (e->x >= pinned_apps.apps[i].x_position &&
+                e->x <= pinned_apps.apps[i].x_position + 30 &&
+                e->y >= 10 && e->y <= 40) {
+                new_hover_index = i + 1000;
+                hovering_pinned_app = i;
+                break;
+            }
+            x += 40;
+        }
 
-      if (new_hover_index != panel_hover_index) {
-          panel_hover_index = new_hover_index;
-          draw_panel();
-      }
-  }
+        // Show/hide tooltip based on hover
+        static int last_tooltip_app = -1;
+        if (hovering_pinned_app != -1) {
+            if (last_tooltip_app != hovering_pinned_app) {
+                hide_tooltip();
+                show_tooltip(pinned_apps.apps[hovering_pinned_app].x_position + 15,
+                            panel.y, &pinned_apps.apps[hovering_pinned_app]);
+                last_tooltip_app = hovering_pinned_app;
+            }
+        } else if (last_tooltip_app != -1) {
+            hide_tooltip();
+            last_tooltip_app = -1;
+        }
 
-  // Handle window dragging
-  if (window_dragging && dragged_client) {
-      if (last_x == 0 && last_y == 0) {
-          // First motion event - initialize last positions
-          last_x = e->x_root;
-          last_y = e->y_root;
-      }
+        // Check window buttons hover if no pinned app hovered
+        if (new_hover_index == -1) {
+            x = 10 + pinned_apps.app_count * 40;
+            if (pinned_apps.app_count > 0) x += 10;
 
-      // Calculate movement delta
-      int delta_x = e->x_root - last_x;
-      int delta_y = e->y_root - last_y;
+            int window_index = 0;
+            for (int i = 0; i < client_count; i++) {
+                if (clients[i] && clients[i]->is_mapped && !is_app_pinned(clients[i])) {
+                    if (e->x >= x && e->x <= x + 40 && e->y >= 10 && e->y <= 40) {
+                        new_hover_index = i;
+                        break;
+                    }
+                    x += 50;
+                    window_index++;
+                }
+            }
+        }
 
-      // Calculate new position
-      int new_x = dragged_client->x + delta_x;
-      int new_y = dragged_client->y + delta_y;
+        if (new_hover_index != panel_hover_index) {
+            panel_hover_index = new_hover_index;
+            draw_panel();
+        }
+    }
 
-      debug_log("Window dragging: delta=%d,%d, new_pos=%d,%d", delta_x, delta_y, new_x, new_y);
+    // Handle window dragging
+    if (window_dragging && dragged_client) {
+        if (last_x == 0 && last_y == 0) {
+            // First motion event - initialize last positions
+            last_x = e->x_root;
+            last_y = e->y_root;
+        }
 
-      // Constrain to screen boundaries
-      int screen_width = DisplayWidth(dpy, screen);
-      int screen_height = DisplayHeight(dpy, screen);
+        // Calculate movement delta
+        int delta_x = e->x_root - last_x;
+        int delta_y = e->y_root - last_y;
 
-      // Keep window within screen bounds
-      if (new_x < 0) new_x = 0;
-      if (new_y < 0) new_y = 0;
-      if (new_x + dragged_client->width > screen_width)
-          new_x = screen_width - dragged_client->width;
-      if (new_y + dragged_client->height > screen_height - PANEL_HEIGHT)
-          new_y = screen_height - PANEL_HEIGHT - dragged_client->height;
+        // Only process if there's significant movement (reduce flickering)
+        if (abs(delta_x) > 1 || abs(delta_y) > 1) {
+            // Calculate new position
+            int new_x = dragged_client->x + delta_x;
+            int new_y = dragged_client->y + delta_y;
 
-      // Only move if position changed
-      if (new_x != dragged_client->x || new_y != dragged_client->y) {
-          // Move the window
-          XMoveWindow(dpy, dragged_client->frame, new_x, new_y);
+            debug_log("Window dragging: delta=%d,%d, new_pos=%d,%d", delta_x, delta_y, new_x, new_y);
 
-          // Update client position
-          dragged_client->x = new_x;
-          dragged_client->y = new_y;
+            // Constrain to screen boundaries
+            int screen_width = DisplayWidth(dpy, screen);
+            int screen_height = DisplayHeight(dpy, screen);
 
-          debug_log("Window moved to %d,%d", new_x, new_y);
-      }
+            // Keep window within screen bounds
+            if (new_x < 0) new_x = 0;
+            if (new_y < 0) new_y = 0;
+            if (new_x + dragged_client->width > screen_width)
+                new_x = screen_width - dragged_client->width;
+            if (new_y + dragged_client->height > screen_height - PANEL_HEIGHT)
+                new_y = screen_height - PANEL_HEIGHT - dragged_client->height;
 
-      // Update last positions
-      last_x = e->x_root;
-      last_y = e->y_root;
-  } else {
-      // Reset last positions when not dragging
-      last_x = 0;
-      last_y = 0;
-  }
+            // Only move if position changed
+            if (new_x != dragged_client->x || new_y != dragged_client->y) {
+                // Move the window
+                XMoveWindow(dpy, dragged_client->frame, new_x, new_y);
 
-  // Handle window resizing
-  if (window_resizing && resized_client) {
-      int delta_x = e->x_root - resize_start_x;
-      int delta_y = e->x_root - resize_start_y;
-      int new_width = resize_start_width;
-      int new_height = resize_start_height;
-      int new_x = resized_client->x;
-      int new_y = resized_client->y;
+                // Update client position
+                dragged_client->x = new_x;
+                dragged_client->y = new_y;
 
-      // Minimum window size
-      int min_width = 100;
-      int min_height = 80;
+                debug_log("Window moved to %d,%d", new_x, new_y);
+            }
 
-      switch (resize_edge) {
-          case 0: // left
-              new_width = resize_start_width - delta_x;
-              new_x = resized_client->x + delta_x;
-              if (new_width < min_width) {
-                  new_width = min_width;
-                  new_x = resized_client->x + resize_start_width - min_width;
-              }
-              break;
-          case 1: // right
-              new_width = resize_start_width + delta_x;
-              if (new_width < min_width) new_width = min_width;
-              break;
-          case 2: // top
-              new_height = resize_start_height - delta_y;
-              new_y = resized_client->y + delta_y;
-              if (new_height < min_height) {
-                  new_height = min_height;
-                  new_y = resized_client->y + resize_start_height - min_height;
-              }
-              break;
-          case 3: // bottom
-              new_height = resize_start_height + delta_y;
-              if (new_height < min_height) new_height = min_height;
-              break;
-          case 4: // top-left
-              new_width = resize_start_width - delta_x;
-              new_height = resize_start_height - delta_y;
-              new_x = resized_client->x + delta_x;
-              new_y = resized_client->y + delta_y;
-              if (new_width < min_width) {
-                  new_width = min_width;
-                  new_x = resized_client->x + resize_start_width - min_width;
-              }
-              if (new_height < min_height) {
-                  new_height = min_height;
-                  new_y = resized_client->y + resize_start_height - min_height;
-              }
-              break;
-          case 5: // top-right
-              new_width = resize_start_width + delta_x;
-              new_height = resize_start_height - delta_y;
-              new_y = resized_client->y + delta_y;
-              if (new_width < min_width) new_width = min_width;
-              if (new_height < min_height) {
-                  new_height = min_height;
-                  new_y = resized_client->y + resize_start_height - min_height;
-              }
-              break;
-          case 6: // bottom-left
-              new_width = resize_start_width - delta_x;
-              new_height = resize_start_height + delta_y;
-              new_x = resized_client->x + delta_x;
-              if (new_width < min_width) {
-                  new_width = min_width;
-                  new_x = resized_client->x + resize_start_width - min_width;
-              }
-              if (new_height < min_height) new_height = min_height;
-              break;
-          case 7: // bottom-right
-              new_width = resize_start_width + delta_x;
-              new_height = resize_start_height + delta_y;
-              if (new_width < min_width) new_width = min_width;
-              if (new_height < min_height) new_height = min_height;
-              break;
-      }
+            // Update last positions
+            last_x = e->x_root;
+            last_y = e->y_root;
+        }
+    } else {
+        // Reset last positions when not dragging
+        last_x = 0;
+        last_y = 0;
+    }
 
-      // Apply the resize
-      if (new_x != resized_client->x || new_y != resized_client->y) {
-          XMoveWindow(dpy, resized_client->frame, new_x, new_y);
-          resized_client->x = new_x;
-          resized_client->y = new_y;
-      }
+    // Handle window resizing
+    if (window_resizing && resized_client) {
+        int delta_x = e->x_root - resize_start_x;
+        int delta_y = e->y_root - resize_start_y;
 
-      if (new_width != resized_client->width || new_height != resized_client->height) {
-          resize_window(resized_client, new_width, new_height);
-      }
+        // Only resize if there's significant movement
+        if (abs(delta_x) > 2 || abs(delta_y) > 2) {
+            int new_width = resize_start_width;
+            int new_height = resize_start_height;
+            int new_x = resized_client->x;
+            int new_y = resized_client->y;
 
-      debug_log("Window resized to %dx%d at %d,%d", new_width, new_height, new_x, new_y);
-  }
+            // Minimum window size
+            int min_width = 100;
+            int min_height = 80;
 
-  // Handle hover effects for windows
-  for (int i = 0; i < client_count; i++) {
-      if (clients[i] && clients[i]->frame == e->window) {
-          update_button_hover(clients[i], e->x, e->y);
-          break;
-      }
-  }
+            switch (resize_edge) {
+                case 0: // left
+                    new_width = resize_start_width - delta_x;
+                    new_x = resized_client->x + delta_x;
+                    if (new_width < min_width) {
+                        new_width = min_width;
+                        new_x = resized_client->x + resize_start_width - min_width;
+                    }
+                    break;
+                case 1: // right
+                    new_width = resize_start_width + delta_x;
+                    if (new_width < min_width) new_width = min_width;
+                    break;
+                case 2: // top
+                    new_height = resize_start_height - delta_y;
+                    new_y = resized_client->y + delta_y;
+                    if (new_height < min_height) {
+                        new_height = min_height;
+                        new_y = resized_client->y + resize_start_height - min_height;
+                    }
+                    break;
+                case 3: // bottom
+                    new_height = resize_start_height + delta_y;
+                    if (new_height < min_height) new_height = min_height;
+                    break;
+                case 4: // top-left
+                    new_width = resize_start_width - delta_x;
+                    new_height = resize_start_height - delta_y;
+                    new_x = resized_client->x + delta_x;
+                    new_y = resized_client->y + delta_y;
+                    if (new_width < min_width) {
+                        new_width = min_width;
+                        new_x = resized_client->x + resize_start_width - min_width;
+                    }
+                    if (new_height < min_height) {
+                        new_height = min_height;
+                        new_y = resized_client->y + resize_start_height - min_height;
+                    }
+                    break;
+                case 5: // top-right
+                    new_width = resize_start_width + delta_x;
+                    new_height = resize_start_height - delta_y;
+                    new_y = resized_client->y + delta_y;
+                    if (new_width < min_width) new_width = min_width;
+                    if (new_height < min_height) {
+                        new_height = min_height;
+                        new_y = resized_client->y + resize_start_height - min_height;
+                    }
+                    break;
+                case 6: // bottom-left
+                    new_width = resize_start_width - delta_x;
+                    new_height = resize_start_height + delta_y;
+                    new_x = resized_client->x + delta_x;
+                    if (new_width < min_width) {
+                        new_width = min_width;
+                        new_x = resized_client->x + resize_start_width - min_width;
+                    }
+                    if (new_height < min_height) new_height = min_height;
+                    break;
+                case 7: // bottom-right
+                    new_width = resize_start_width + delta_x;
+                    new_height = resize_start_height + delta_y;
+                    if (new_width < min_width) new_width = min_width;
+                    if (new_height < min_height) new_height = min_height;
+                    break;
+            }
 
-  // Handle hover effects for menu
-  if (menu.visible && e->window == menu.win) {
-      int relative_y = e->y;
-      int new_hover_item = relative_y / MENU_ITEM_HEIGHT;
+            // Apply the resize
+            if (new_x != resized_client->x || new_y != resized_client->y) {
+                XMoveWindow(dpy, resized_client->frame, new_x, new_y);
+                resized_client->x = new_x;
+                resized_client->y = new_y;
+            }
 
-      if (new_hover_item >= 0 && new_hover_item < 4) {
-          if (menu.hover_item != new_hover_item) {
-              menu.hover_item = new_hover_item;
-              draw_menu();
-          }
-      } else if (menu.hover_item != -1) {
-          menu.hover_item = -1;
-          draw_menu();
-      }
-  }
+            if (new_width != resized_client->width || new_height != resized_client->height) {
+                resize_window(resized_client, new_width, new_height);
+            }
 
-  // Handle hover effects for window control menu
-  if (window_control_menu.visible && e->window == window_control_menu.win) {
-      int relative_y = e->y;
-      int new_hover_item = relative_y / MENU_ITEM_HEIGHT;
+            debug_log("Window resized to %dx%d at %d,%d", new_width, new_height, new_x, new_y);
+        }
+    }
 
-      if (new_hover_item >= 0 && new_hover_item < 4) {
-          if (window_control_menu.hover_item != new_hover_item) {
-              window_control_menu.hover_item = new_hover_item;
-              draw_window_control_menu();
-          }
-      } else if (window_control_menu.hover_item != -1) {
-          window_control_menu.hover_item = -1;
-          draw_window_control_menu();
-      }
-  }
+    // Handle hover effects for windows (throttled)
+    for (int i = 0; i < client_count; i++) {
+        if (clients[i] && clients[i]->frame == e->window && time_since_last_check > 50) {
+            update_button_hover(clients[i], e->x, e->y);
+            break;
+        }
+    }
 
-  // Handle hover effects for pinned app menu
-  if (pinned_app_menu.visible && e->window == pinned_app_menu.win) {
-      int relative_y = e->y;
-      int new_hover_item = relative_y / MENU_ITEM_HEIGHT;
+    // Handle hover effects for menu
+    if (menu.visible && e->window == menu.win) {
+        int relative_y = e->y;
+        int new_hover_item = relative_y / MENU_ITEM_HEIGHT;
 
-      if (new_hover_item >= 0 && new_hover_item < 2) {
-          if (pinned_app_menu.hover_item != new_hover_item) {
-              pinned_app_menu.hover_item = new_hover_item;
-              draw_pinned_app_menu();
-          }
-      } else if (pinned_app_menu.hover_item != -1) {
-          pinned_app_menu.hover_item = -1;
-          draw_pinned_app_menu();
-      }
-  }
+        if (new_hover_item >= 0 && new_hover_item < 4) {
+            if (menu.hover_item != new_hover_item) {
+                menu.hover_item = new_hover_item;
+                draw_menu();
+            }
+        } else if (menu.hover_item != -1) {
+            menu.hover_item = -1;
+            draw_menu();
+        }
+    }
 
-  // Handle hover effects for app launcher
-  if (app_launcher.visible) {
-      int new_hover_item = get_app_launcher_item_at(e->x_root, e->y_root);
-      if (app_launcher.hover_item != new_hover_item) {
-          app_launcher.hover_item = new_hover_item;
-          draw_app_launcher();
-      }
-  }
+    // Handle hover effects for window control menu
+    if (window_control_menu.visible && e->window == window_control_menu.win) {
+        int relative_y = e->y;
+        int new_hover_item = relative_y / MENU_ITEM_HEIGHT;
+
+        if (new_hover_item >= 0 && new_hover_item < 4) {
+            if (window_control_menu.hover_item != new_hover_item) {
+                window_control_menu.hover_item = new_hover_item;
+                draw_window_control_menu();
+            }
+        } else if (window_control_menu.hover_item != -1) {
+            window_control_menu.hover_item = -1;
+            draw_window_control_menu();
+        }
+    }
+
+    // Handle hover effects for pinned app menu
+    if (pinned_app_menu.visible && e->window == pinned_app_menu.win) {
+        int relative_y = e->y;
+        int new_hover_item = relative_y / MENU_ITEM_HEIGHT;
+
+        // Check if app is running to determine valid menu items
+        int is_running = 0;
+        if (pinned_app_menu.target_pinned_app && pinned_app_menu.target_pinned_app->name) {
+            for (int i = 0; i < client_count; i++) {
+                if (clients[i] && clients[i]->title &&
+                    strcmp(clients[i]->title, pinned_app_menu.target_pinned_app->name) == 0) {
+                    is_running = 1;
+                    break;
+                }
+            }
+        }
+
+        // Adjust hover item for non-running apps (skip empty slots)
+        if (!is_running) {
+            if (new_hover_item >= 1 && new_hover_item <= 3) {
+                new_hover_item = -1; // Skip empty slots
+            } else if (new_hover_item == 4) {
+                new_hover_item = 1; // Unpin is the only option after Launch
+            }
+        }
+
+        if (new_hover_item >= 0 && new_hover_item < 5) {
+            if (pinned_app_menu.hover_item != new_hover_item) {
+                pinned_app_menu.hover_item = new_hover_item;
+                draw_pinned_app_menu();
+            }
+        } else if (pinned_app_menu.hover_item != -1) {
+            pinned_app_menu.hover_item = -1;
+            draw_pinned_app_menu();
+        }
+    }
+
+    // Handle hover effects for app launcher (throttled)
+    if (app_launcher.visible && time_since_last_check > 50) {
+        int new_hover_item = get_app_launcher_item_at(e->x_root, e->y_root);
+        if (app_launcher.hover_item != new_hover_item) {
+            app_launcher.hover_item = new_hover_item;
+            draw_app_launcher();
+        }
+    }
 }
 
 void handle_key_press(XKeyEvent *e) {
@@ -3612,10 +4052,36 @@ int main() {
   pinned_apps.app_count = 0;
   load_pinned_apps();
 
+  // After load_pinned_apps() call in main()
+  debug_log("=== PINNED APPS VERIFICATION ===");
+  debug_log("Total pinned apps loaded: %d", pinned_apps.app_count);
+  for (int i = 0; i < pinned_apps.app_count; i++) {
+      debug_log("Pinned app %d: name='%s', exec='%s', icon='%s'",
+               i,
+               pinned_apps.apps[i].name ? pinned_apps.apps[i].name : "NULL",
+               pinned_apps.apps[i].exec ? pinned_apps.apps[i].exec : "NULL",
+               pinned_apps.apps[i].icon_path ? pinned_apps.apps[i].icon_path : "NULL");
+  }
+  debug_log("=== END PINNED APPS VERIFICATION ===");
+
+  // Force initial panel draw with pinned apps
+  draw_panel();
+  XFlush(dpy);
+
   create_menu();
   create_app_launcher();
   create_window_control_menu();
   create_pinned_app_menu();
+
+  // Create tooltip window
+  tooltip.width = 100;
+  tooltip.height = 30;
+  tooltip.visible = 0;
+  tooltip.target_app = NULL;
+  tooltip.win = XCreateSimpleWindow(dpy, root, 0, 0,
+                                   tooltip.width, tooltip.height,
+                                   0, white, dark_blue);
+  XSelectInput(dpy, tooltip.win, ExposureMask);
 
   debug_log("App launcher created with %d categories", app_launcher.category_count);
   for (int i = 0; i < app_launcher.category_count; i++) {
@@ -3753,6 +4219,8 @@ int main() {
                       draw_window_control_menu();
                   } else if (ev.xexpose.window == pinned_app_menu.win) {
                       draw_pinned_app_menu();
+                  } else if (ev.xexpose.window == tooltip.win) {
+                      draw_tooltip();
                   } else {
                       for (int i = 0; i < client_count; i++) {
                           if (clients[i] && clients[i]->frame == ev.xexpose.window) {
@@ -3767,7 +4235,7 @@ int main() {
                   break;
           }
       } else {
-          usleep(100000);
+          usleep(50000);
       }
   }
 
