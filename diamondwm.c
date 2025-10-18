@@ -506,6 +506,7 @@ void show_menu() {
 
         XMoveWindow(dpy, menu.win, menu.x, menu.y);
         XMapWindow(dpy, menu.win);
+        XRaiseWindow(dpy, menu.win);
         menu.visible = 1;
 
         // Fade-in animation
@@ -988,7 +989,7 @@ void load_applications() {
 }
 
 void lock_screen() {
-    debug_log("Creating simple lock screen");
+    debug_log("Creating enhanced lock screen with diamond logo");
 
     // Create a fullscreen lock window
     Window lock_win = XCreateSimpleWindow(dpy, root, 0, 0,
@@ -1012,13 +1013,62 @@ void lock_screen() {
     XMapWindow(dpy, lock_win);
     XRaiseWindow(dpy, lock_win);
 
-    // Draw lock message
-    char *message = "Screen Locked - Press any key to unlock";
-    int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), message, strlen(message));
-    int x = (DisplayWidth(dpy, screen) - text_width) / 2;
-    int y = DisplayHeight(dpy, screen) / 2;
+    int screen_width = DisplayWidth(dpy, screen);
+    int screen_height = DisplayHeight(dpy, screen);
+    int center_x = screen_width / 2;
+    int center_y = screen_height / 2;
 
-    XDrawString(dpy, lock_win, lock_gc, x, y, message, strlen(message));
+    // Draw large diamond logo (100x100 pixels)
+    int diamond_size = 100;
+    int diamond_x = center_x - diamond_size / 2;
+    int diamond_y = center_y - diamond_size / 2 - 60; // Offset up to make room for text
+
+    XPoint diamond[] = {
+        {center_x, diamond_y},                           // top
+        {diamond_x + diamond_size, center_y - 60},      // right
+        {center_x, diamond_y + diamond_size},           // bottom
+        {diamond_x, center_y - 60}                      // left
+    };
+
+    // Draw glowing effect
+    for (int i = 5; i > 0; i--) {
+        int alpha = 150 - (i * 25);
+        unsigned long glow_color = purple_color - (i * 0x0F0F0F);
+        XSetForeground(dpy, lock_gc, glow_color);
+
+        XPoint glow[] = {
+            {center_x, diamond_y - i},
+            {diamond_x + diamond_size + i, center_y - 60},
+            {center_x, diamond_y + diamond_size + i},
+            {diamond_x - i, center_y - 60}
+        };
+        XDrawLines(dpy, lock_win, lock_gc, glow, 4, CoordModeOrigin);
+    }
+
+    // Draw main diamond
+    XSetForeground(dpy, lock_gc, purple_color);
+    XFillPolygon(dpy, lock_win, lock_gc, diamond, 4, Convex, CoordModeOrigin);
+
+    // Draw highlight
+    XSetForeground(dpy, lock_gc, accent_light);
+    XDrawLine(dpy, lock_win, lock_gc, center_x, diamond_y,
+              diamond_x + diamond_size - 1, center_y - 60 - 1);
+
+    // Draw "DiamondWM" text
+    XSetForeground(dpy, lock_gc, text_primary);
+    XFontStruct* font = XLoadQueryFont(dpy, "fixed");
+    char *title = "DiamondWM";
+    int title_width = XTextWidth(font, title, strlen(title));
+    XDrawString(dpy, lock_win, lock_gc, center_x - title_width / 2, center_y + 60,
+                title, strlen(title));
+
+    // Draw lock message
+    XSetForeground(dpy, lock_gc, text_secondary);
+    char *message = "Press any key to unlock";
+    int text_width = XTextWidth(font, message, strlen(message));
+    XDrawString(dpy, lock_win, lock_gc, center_x - text_width / 2, center_y + 85,
+                message, strlen(message));
+
     XFlush(dpy);
 
     // Wait for any key press to unlock
@@ -1041,7 +1091,7 @@ void lock_screen() {
     XFreeGC(dpy, lock_gc);
 
     show_operation_feedback("Screen unlocked");
-    debug_log("Simple lock screen deactivated");
+    debug_log("Enhanced lock screen deactivated");
 }
 
 void create_app_launcher() {
@@ -1087,6 +1137,7 @@ void show_app_launcher(int x, int y) {
 
         XMoveWindow(dpy, app_launcher.win, app_launcher.x, app_launcher.y);
         XMapWindow(dpy, app_launcher.win);
+        XRaiseWindow(dpy, app_launcher.win);
         app_launcher.visible = 1;
 
         // GRAB THE KEYBOARD with proper error handling
