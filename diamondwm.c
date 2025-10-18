@@ -4,6 +4,7 @@
 #include <X11/keysym.h>
 #include <X11/cursorfont.h>
 #include <X11/extensions/shape.h>
+#include <X11/Xft/Xft.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -155,6 +156,17 @@ typedef struct {
 
 AppLauncherMenu app_launcher;
 
+typedef struct {
+    XftFont *regular;
+    XftFont *bold;
+    XftFont *title;
+} XftFontSystem;
+
+// Add these global variables after your existing ones
+XftFontSystem xft_fonts;
+XftDraw *xft_draw = NULL;
+XftColor xft_color, xft_panel_color, xft_menu_color, xft_title_color;
+
 // Function declarations
 void create_panel();
 void draw_panel();
@@ -211,6 +223,83 @@ void create_window_control_menu();
 void show_window_control_menu(int x, int y, Client *c);
 void hide_window_control_menu();
 void draw_window_control_menu();
+
+// Xft font loading (for anti-aliased fonts)
+void load_xft_fonts() {
+    debug_log("Loading Xft fonts...");
+
+    // Try modern fonts first, then fallbacks
+    const char* font_families[] = {
+        "Inter", "SF Pro Display", "Segoe UI", "Roboto", "Ubuntu", "DejaVu Sans", "Liberation Sans", "sans-serif", NULL
+    };
+
+    xft_fonts.regular = NULL;
+    for (int i = 0; font_families[i] && !xft_fonts.regular; i++) {
+        xft_fonts.regular = XftFontOpen(dpy, screen,
+            XFT_FAMILY, XftTypeString, font_families[i],
+            XFT_SIZE, XftTypeDouble, 8.0,
+            XFT_WEIGHT, XftTypeInteger, 400, // Medium
+            NULL);
+        if (xft_fonts.regular) debug_log("Loaded Xft regular: %s", font_families[i]);
+    }
+
+    xft_fonts.bold = NULL;
+    for (int i = 0; font_families[i] && !xft_fonts.bold; i++) {
+        xft_fonts.bold = XftFontOpen(dpy, screen,
+            XFT_FAMILY, XftTypeString, font_families[i],
+            XFT_SIZE, XftTypeDouble, 9.0,
+            XFT_WEIGHT, XftTypeInteger, 700, // Bold
+            NULL);
+        if (xft_fonts.bold) debug_log("Loaded Xft bold: %s", font_families[i]);
+    }
+
+    xft_fonts.title = NULL;
+    for (int i = 0; font_families[i] && !xft_fonts.title; i++) {
+        xft_fonts.title = XftFontOpen(dpy, screen,
+            XFT_FAMILY, XftTypeString, font_families[i],
+            XFT_SIZE, XftTypeDouble, 10.0,
+            XFT_WEIGHT, XftTypeInteger, 600, // Semi-bold
+            NULL);
+        if (xft_fonts.title) debug_log("Loaded Xft title: %s", font_families[i]);
+    }
+
+    if (!xft_fonts.regular) {
+        debug_log("WARNING: No Xft fonts available, using basic fonts");
+    }
+}
+
+// Draw text with Xft (anti-aliased)
+void draw_xft_text(Drawable d, int x, int y, const char *text, XftFont *font, unsigned long color) {
+    if (!font) return;
+
+    if (!xft_draw) {
+        xft_draw = XftDrawCreate(dpy, d, DefaultVisual(dpy, screen),
+                                 DefaultColormap(dpy, screen));
+    }
+
+    if (!xft_draw) {
+        debug_log("ERROR: Could not create Xft draw");
+        return;
+    }
+
+    // Convert color to XftColor
+    XRenderColor render_color;
+    render_color.red = ((color >> 16) & 0xFF) * 257;
+    render_color.green = ((color >> 8) & 0xFF) * 257;
+    render_color.blue = (color & 0xFF) * 257;
+    render_color.alpha = 0xFFFF;
+
+    if (XftColorAllocValue(dpy, DefaultVisual(dpy, screen),
+                          DefaultColormap(dpy, screen),
+                          &render_color, &xft_color)) {
+
+        XftDrawStringUtf8(xft_draw, &xft_color, font, x, y + font->ascent,
+                         (XftChar8 *)text, strlen(text));
+
+        XftColorFree(dpy, DefaultVisual(dpy, screen),
+                    DefaultColormap(dpy, screen), &xft_color);
+    }
+}
 
 void set_background() {
     system("feh --bg-scale /usr/share/backgrounds/* 2>/dev/null &");
@@ -443,35 +532,100 @@ int is_window_visible(Client *c) {
 }
 
 void draw_diamond_icon(int x, int y, int size) {
-    // Draw glowing purple diamond with gradient
-    XPoint diamond[] = {
-        {x + size/2, y},
-        {x + size, y + size/2},
-        {x + size/2, y + size},
-        {x, y + size/2}
-    };
+    int center_x = x + size / 2;
+    int center_y = y + size / 2;
+    float scale_factor = size / 32.0f; // Scale based on original 32px design
 
-    // Enhanced glow effect
-    for (int i = 3; i > 0; i--) {
-        int alpha = 100 - (i * 25);
-        unsigned long glow_color = purple_color - (i * 0x111111);
+    // 1. Outer glow effect (multi-layered aurora)
+    for (int i = 6; i > 0; i--) {
+        float alpha = (float)i / 6.0f;
+        int glow_offset = (int)(i * 2 * scale_factor);
+
+        // Aurora effect - purple to blue gradient
+        int r = (int)(138 * alpha + (66 * (1 - alpha)));
+        int g = (int)(43 * alpha + (92 * (1 - alpha)));
+        int b = (int)(226 * alpha + (231 * (1 - alpha)));
+        unsigned long glow_color = (r << 16) | (g << 8) | b;
+
         XSetForeground(dpy, panel_gc, glow_color);
         XPoint glow[] = {
-            {x + size/2, y - i},
-            {x + size + i, y + size/2},
-            {x + size/2, y + size + i},
-            {x - i, y + size/2}
+            {center_x, y - glow_offset},
+            {x + size + glow_offset, center_y},
+            {center_x, y + size + glow_offset},
+            {x - glow_offset, center_y}
         };
         XDrawLines(dpy, panel.win, panel_gc, glow, 4, CoordModeOrigin);
     }
 
-    // Main diamond with gradient effect
-    XSetForeground(dpy, panel_gc, purple_color);
-    XFillPolygon(dpy, panel.win, panel_gc, diamond, 4, Convex, CoordModeOrigin);
+    // 2. Main diamond body with gradient facets
+    // Pavilion (bottom part - darker base)
+    int pav_offset = (int)(6 * scale_factor);
+    XPoint pavilion[] = {
+        {center_x, center_y + (int)(3 * scale_factor)},
+        {x + size - pav_offset, center_y},
+        {center_x, y + size},
+        {x + pav_offset, center_y}
+    };
+    XSetForeground(dpy, panel_gc, 0x5D3BA8); // Deep purple
+    XFillPolygon(dpy, panel.win, panel_gc, pavilion, 4, Convex, CoordModeOrigin);
 
-    // Highlight
-    XSetForeground(dpy, panel_gc, accent_light);
-    XDrawLine(dpy, panel.win, panel_gc, x + size/2, y, x + size - 1, y + size/2 - 1);
+    // 3. Crown facets (upper part with highlights)
+    // Left facet
+    int crown_height = (int)(10 * scale_factor);
+    XPoint left_facet[] = {
+        {center_x, y + crown_height},
+        {x + pav_offset, center_y},
+        {center_x, center_y + (int)(3 * scale_factor)}
+    };
+    XSetForeground(dpy, panel_gc, 0x7C3AED); // Medium purple
+    XFillPolygon(dpy, panel.win, panel_gc, left_facet, 3, Convex, CoordModeOrigin);
+
+    // Right facet (highlight area)
+    XPoint right_facet[] = {
+        {center_x, y + crown_height},
+        {center_x, center_y + (int)(3 * scale_factor)},
+        {x + size - pav_offset, center_y}
+    };
+    XSetForeground(dpy, panel_gc, 0x9D7BF5); // Light purple highlight
+    XFillPolygon(dpy, panel.win, panel_gc, right_facet, 3, Convex, CoordModeOrigin);
+
+    // 4. Table (top flat surface)
+    int table_width = (int)(8 * scale_factor);
+    int table_height = (int)(3 * scale_factor);
+    XPoint table[] = {
+        {center_x - table_width, y + crown_height},
+        {center_x + table_width, y + crown_height},
+        {center_x + table_width - (int)(2 * scale_factor), center_y - table_height},
+        {center_x - table_width + (int)(2 * scale_factor), center_y - table_height}
+    };
+    XSetForeground(dpy, panel_gc, 0xA78BFA); // Lightest purple
+    XFillPolygon(dpy, panel.win, panel_gc, table, 4, Convex, CoordModeOrigin);
+
+    // 5. Sparkle highlights (realistic light reflection)
+    XSetForeground(dpy, panel_gc, 0xFFFFFF); // Pure white
+    // Main sparkle
+    int sparkle_size = (int)(3 * scale_factor);
+    if (sparkle_size > 0) {
+        XFillArc(dpy, panel.win, panel_gc,
+                center_x - sparkle_size/2, y + (int)(8 * scale_factor),
+                sparkle_size, sparkle_size, 0, 360*64);
+    }
+    // Secondary sparkles
+    XDrawPoint(dpy, panel.win, panel_gc, center_x + (int)(5 * scale_factor), y + (int)(12 * scale_factor));
+    XDrawPoint(dpy, panel.win, panel_gc, center_x - (int)(4 * scale_factor), center_y - (int)(2 * scale_factor));
+
+    // 6. Edge highlights for 3D depth
+    XSetForeground(dpy, panel_gc, 0xE9D5FF); // Very light purple
+    XDrawLine(dpy, panel.win, panel_gc, center_x, y + crown_height,
+              center_x + table_width, y + crown_height); // Top edge
+    XDrawLine(dpy, panel.win, panel_gc, center_x + table_width, y + crown_height,
+              center_x + table_width - (int)(2 * scale_factor), center_y - table_height); // Right-top edge
+
+    // 7. Pavilion shadow for depth
+    XSetForeground(dpy, panel_gc, 0x4C2889); // Dark purple shadow
+    XDrawLine(dpy, panel.win, panel_gc,
+              center_x - (int)(4 * scale_factor), y + size - (int)(2 * scale_factor),
+              center_x + (int)(4 * scale_factor), y + size - (int)(2 * scale_factor));
 }
 
 void draw_clock() {
@@ -1578,8 +1732,7 @@ void draw_panel() {
                       background_dark, background_light, 1);
 
     // Draw client icons/buttons with modern styling
-    int x = 20;
-    XSetForeground(dpy, panel_gc, text_primary);
+    int x = 10;
 
     for (int i = 0; i < client_count; i++) {
         if (clients[i] && clients[i]->is_mapped) {
@@ -1598,26 +1751,46 @@ void draw_panel() {
             XDrawRectangle(dpy, panel.win, panel_gc, x, 10, 40, 30);
             XSetLineAttributes(dpy, panel_gc, 1, LineSolid, CapRound, JoinRound);
 
-            // Draw window identifier
+            // Draw window identifier with anti-aliased font
             char label[10];
             snprintf(label, sizeof(label), "%d", i+1);
-            XSetForeground(dpy, panel_gc, clients[i]->is_active ? text_primary : text_secondary);
-            XDrawString(dpy, panel.win, panel_gc, x + 15, 30, label, strlen(label));
+
+            // Center the number in the button - use smaller font
+            int text_x = x + 18;
+            int text_y = 17; // Better vertical centering for smaller font
+
+            // Use a smaller font for the window numbers
+            if (xft_fonts.regular) {
+                draw_xft_text(panel.win, text_x, text_y, label, xft_fonts.regular,
+                             clients[i]->is_active ? text_primary : text_secondary);
+            } else {
+                // Fallback to original font if Xft not available
+                XSetForeground(dpy, panel_gc, clients[i]->is_active ? text_primary : text_secondary);
+                XDrawString(dpy, panel.win, panel_gc, x + 15, 30, label, strlen(label));
+            }
             x += 50;
         }
     }
 
     // Draw DiamondWM area with modern styling
-    int diamond_size = 20;
+    int diamond_size = 15;
     int diamond_x = panel.width - 120;
     int diamond_y = (PANEL_HEIGHT - diamond_size) / 2;
 
     draw_diamond_icon(diamond_x, diamond_y, diamond_size);
 
-    int text_x = diamond_x + diamond_size + 5;
-    int text_y = 30;
-    XSetForeground(dpy, panel_gc, text_primary);
-    XDrawString(dpy, panel.win, panel_gc, text_x, text_y, "DiamondWM", 9);
+    // Draw "DiamondWM" text with proper positioning
+    int text_x = diamond_x + diamond_size + 10;
+    int text_y = 17; // Better vertical alignment
+
+    // Use regular font instead of title font for proper size
+    if (xft_fonts.regular) {
+        draw_xft_text(panel.win, text_x, text_y, "DiamondWM", xft_fonts.regular, text_primary);
+    } else {
+        // Fallback to original font if Xft not available
+        XSetForeground(dpy, panel_gc, text_primary);
+        XDrawString(dpy, panel.win, panel_gc, text_x, 30, "DiamondWM", 9);
+    }
 
     draw_clock();
 }
@@ -2777,17 +2950,18 @@ void draw_window_control_menu() {
                      window_control_menu.width - 10, y);
         }
 
-        XSetForeground(dpy, menu_gc, text_primary);
-        int text_width = XTextWidth(XLoadQueryFont(dpy, "fixed"), items[i], strlen(items[i]));
-        int text_x = (window_control_menu.width - text_width) / 2;
+        // Calculate text position for proper centering
         int text_y = y + (MENU_ITEM_HEIGHT / 2) + 5;
 
-        XDrawString(dpy, window_control_menu.win, menu_gc, text_x, text_y,
-                   items[i], strlen(items[i]));
+        // Draw menu item text with anti-aliased font
+        draw_xft_text(window_control_menu.win,
+                     window_control_menu.width / 2,  // Center horizontally
+                     text_y,
+                     items[i],
+                     xft_fonts.regular,
+                     text_primary);
     }
 }
-
-
 
 int main() {
     remove("/tmp/diamondwm_debug.log");
@@ -2881,6 +3055,35 @@ int main() {
     button_gv.foreground = light_gray;
     button_gv.background = titlebar_gray;
     button_gc = XCreateGC(dpy, root, GCForeground | GCBackground, &button_gv);
+
+    // Initialize Xft colors
+    XRenderColor render_color;
+    render_color.red = ((text_primary >> 16) & 0xFF) * 257;
+    render_color.green = ((text_primary >> 8) & 0xFF) * 257;
+    render_color.blue = (text_primary & 0xFF) * 257;
+    render_color.alpha = 0xFFFF;
+    XftColorAllocValue(dpy, DefaultVisual(dpy, screen),
+                      DefaultColormap(dpy, screen),
+                      &render_color, &xft_panel_color);
+
+    render_color.red = ((text_secondary >> 16) & 0xFF) * 257;
+    render_color.green = ((text_secondary >> 8) & 0xFF) * 257;
+    render_color.blue = (text_secondary & 0xFF) * 257;
+    render_color.alpha = 0xFFFF;
+    XftColorAllocValue(dpy, DefaultVisual(dpy, screen),
+                      DefaultColormap(dpy, screen),
+                      &render_color, &xft_menu_color);
+
+    render_color.red = ((text_primary >> 16) & 0xFF) * 257;
+    render_color.green = ((text_primary >> 8) & 0xFF) * 257;
+    render_color.blue = (text_primary & 0xFF) * 257;
+    render_color.alpha = 0xFFFF;
+    XftColorAllocValue(dpy, DefaultVisual(dpy, screen),
+                      DefaultColormap(dpy, screen),
+                      &render_color, &xft_title_color);
+
+    // Load Xft fonts
+    load_xft_fonts();
 
     XSelectInput(dpy, root,
         SubstructureRedirectMask | SubstructureNotifyMask |
@@ -3033,7 +3236,15 @@ int main() {
         }
     }
 
+
     free_applications();
+
+    // Clean up Xft resources
+    if (xft_fonts.regular) XftFontClose(dpy, xft_fonts.regular);
+    if (xft_fonts.bold) XftFontClose(dpy, xft_fonts.bold);
+    if (xft_fonts.title) XftFontClose(dpy, xft_fonts.title);
+    if (xft_draw) XftDrawDestroy(xft_draw);
+
     debug_log("=== Modern DiamondWM Exiting ===");
     XCloseDisplay(dpy);
     return 0;

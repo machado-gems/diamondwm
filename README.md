@@ -15,17 +15,18 @@ A simple, lightweight X11 window manager with a diamond-inspired design. Minimal
 ### Install Dependencies
 ```bash
 sudo apt update
-sudo apt install libx11-dev
-sudo apt install libxext-dev
+sudo apt install libx11-dev libxext-dev
+sudo apt install libxft-dev libfontconfig-dev libfreetype6-dev
+sudo apt install libm-dev
 sudo apt install feh
-sudo apt install xterm
-sudo apt install x11-apps
+sudo apt install xterm x11-apps
+sudo apt install gcc make pkg-config gdb
 ```
 
 ## Installation
 ### Compile from Source
 ```bash
-gcc -o diamondwm diamondwm.c -lX11
+make
 ```
 
 ### Install System-wide
@@ -70,7 +71,7 @@ Contributions are welcome! Please feel free to submit pull requests or open issu
 2. Clone or download the source code  
 3. Compile using:
    ```bash
-   gcc -o diamondwm diamondwm.c -lX11
+   make
    ```
 ## Troubleshooting
 If you encounter any issues:
